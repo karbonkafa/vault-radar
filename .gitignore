@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.DS_Store
+events.jsonl
+
+# local runtime state
+.vault-radar/
+*.log
+
+# environments / editors
+.venv/
+node_modules/
+.obsidian/
+.idea/
+.vscode/

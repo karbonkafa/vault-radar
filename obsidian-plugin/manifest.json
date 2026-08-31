@@ -1,0 +1,9 @@
+{
+  "id": "vault-radar",
+  "name": "Vault Radar",
+  "version": "0.1.0",
+  "minAppVersion": "1.4.0",
+  "description": "Light up your graph view in real time as a coding agent reads your notes.",
+  "author": "Selma Kocabıyık",
+  "isDesktopOnly": true
+}
