@@ -901,6 +901,54 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+BUILTIN_THEME_NAMES = ("radar", "obsidian", "sonar", "sonar-green", "constellation", "blueprint")
+
+
+def _theme_file() -> Path:
+    return Path(HOME) / "theme"
+
+
+def recorded_theme() -> Optional[str]:
+    """The opening theme recorded by `radar.py theme <name>`; None means the page default."""
+    try:
+        name = _theme_file().read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return name or None
+
+
+def known_themes() -> List[str]:
+    names = list(BUILTIN_THEME_NAMES)
+    try:
+        names += [n for n in load_themes() if n not in names]
+    except Exception:
+        pass
+    return names
+
+
+def viewer_url(port: int) -> str:
+    """Viewer URL for window/serve: the recorded opening theme rides along as ?theme=."""
+    base = f"http://localhost:{port}"
+    theme = recorded_theme()
+    return f"{base}/?theme={theme}" if theme else base
+
+
+def cmd_theme(args: argparse.Namespace) -> int:
+    """Record the opening theme, or print the recorded one."""
+    if not args.name:
+        print(recorded_theme() or "radar")
+        return 0
+    names = known_themes()
+    if args.name not in names:
+        print("unknown theme: %s (known: %s)" % (args.name, ", ".join(names)), file=sys.stderr)
+        return 1
+    path = _theme_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(args.name + "\n", encoding="utf-8")
+    print(args.name)
+    return 0
+
+
 def cmd_window(args: argparse.Namespace) -> int:
     """Open the existing viewer without starting or owning a server."""
     import urllib.error
@@ -916,8 +964,9 @@ def cmd_window(args: argparse.Namespace) -> int:
     if status != 200:
         print(f"vault-radar server at {url} returned HTTP {status}", file=sys.stderr)
         return 1
-    open_window(url, args.width)
-    print(f"opened existing viewer: {url}")
+    target = viewer_url(args.port)
+    open_window(target, args.width)
+    print(f"opened existing viewer: {target}")
     return 0
 
 
@@ -1342,6 +1391,10 @@ def main() -> int:
     agents.add_argument("--no-notify", action="store_true", help="no macOS notification on a new offer")
     agents.add_argument("--app-support", help="IDE workspace records root (default ~/Library/Application Support)")
     agents.set_defaults(fn=cmd_agents)
+
+    theme = sub.add_parser("theme", help="record the opening theme used by window and serve (no name: print it)")
+    theme.add_argument("name", nargs="?", help="radar | obsidian | sonar | sonar-green | constellation | blueprint | a ~/.vault-radar/themes name")
+    theme.set_defaults(fn=cmd_theme)
 
     install = sub.add_parser("hook-install", help="write an agent's radar hook config, idempotently")
     install.add_argument("agent", nargs="?", help="cursor | antigravity (recipes); claude | kai | codex | kimi (manual)")
