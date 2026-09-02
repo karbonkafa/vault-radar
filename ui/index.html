@@ -237,6 +237,7 @@ function markRead(idx,chars,delegated){
 function handle(ev){
   if(ev.kind==='prompt') ACTIVE=ev.session||null;
   else if(ACTIVE&&ev.session&&ev.session!==ACTIVE) return;
+  if(ev.kind==='reset'){ clearTurn(); setPrompt(T.waiting); agent.on=false; return; }
   if(ev.kind==='prompt'){
     setPrompt(ev.text);
     clearTurn(); heat=0.35; agent.on=false; return;

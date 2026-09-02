@@ -300,6 +300,23 @@ def _scan_hits(response: Any, cwd: str = "") -> List[str]:
     return out
 
 
+def _append_events(events: List[Dict[str, Any]]) -> None:
+    """Append events to the log with one O_APPEND write().
+
+    Several sessions append to this file at the same time, and a buffered text
+    writer splits a long line (a Grep with hundreds of hits) into chunks that
+    interleave.
+    """
+    line = "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in events).encode("utf-8")
+    HOME.mkdir(parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0)
+    fd = os.open(str(EVENTS), flags, 0o600)
+    try:
+        os.write(fd, line)
+    finally:
+        os.close(fd)
+
+
 def cmd_hook(_args: argparse.Namespace) -> int:
     """Read one hook payload on stdin and append a radar event. Never blocks Claude."""
     try:
@@ -319,17 +336,7 @@ def cmd_hook(_args: argparse.Namespace) -> int:
                 stamp[key] = str(payload[key])
         for event in events:
             event.update(stamp)
-        line = "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in events).encode("utf-8")
-        HOME.mkdir(parents=True, exist_ok=True)
-        # One O_APPEND write() per hook call. Several Claude Code sessions append to
-        # this file at the same time, and a buffered text writer splits a long
-        # line (a Grep with hundreds of hits) into chunks that interleave.
-        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0)
-        fd = os.open(str(EVENTS), flags, 0o600)
-        try:
-            os.write(fd, line)
-        finally:
-            os.close(fd)
+        _append_events(events)
     except Exception:
         pass  # radar is an observer; it is never allowed to fail loudly
     return 0
@@ -433,8 +440,8 @@ def tail(path: Path, start_at_end: bool) -> Iterator[str]:
                     fh.seek(0, os.SEEK_END)
                     start_at_end = False
                 else:
-                    # The log can shrink under us: /api/reset unlinks it and the
-                    # next hook recreates it at size 0. Without this the stale
+                    # The log can shrink under us: deleted by hand, then recreated
+                    # at size 0 by the next hook. Without this the stale
                     # offset seeks past EOF and the stream is dead for good.
                     try:
                         if os.fstat(fh.fileno()).st_size < pos:
@@ -480,7 +487,8 @@ def _same_session(row: Dict[str, Any], session: Optional[str]) -> bool:
 
 
 def current_turn(limit: int = 4000) -> List[str]:
-    """Return the events of the turn in progress: everything after the last prompt.
+    """Return the events of the turn in progress: everything after the last prompt,
+    or after the last RESET if that came later.
 
     Read as a whole so a viewer opened halfway through a turn still shows the
     files already touched.
@@ -499,15 +507,19 @@ def current_turn(limit: int = 4000) -> List[str]:
     # silently steals the viewer. A pin (see pinned_session) names the session
     # to anchor on instead, so a busy neighbour cannot steal it at all.
     pin = pinned_session()
-    start, session = 0, pin
+    start, session, reset_at = 0, pin, None
     for i in range(len(lines) - 1, -1, -1):
         try:
             row = json.loads(lines[i])
         except ValueError:
             continue
+        if row.get("kind") == "reset" and reset_at is None:
+            reset_at = i  # RESET was pressed during this turn: replay from there
         if row.get("kind") == "prompt" and _same_session(row, pin):
             start, session = i, (row.get("session") or pin)
             break
+    if reset_at is not None:
+        start = max(start, reset_at + 1)
 
     out = []
     for ln in lines[start:]:
@@ -610,8 +622,11 @@ def make_handler(vault: Path, exts: List[str], alias: Optional[Path] = None):
             if 0 < length <= 1 << 20:
                 self.rfile.read(length)
             if self.path.split("?", 1)[0] == "/api/reset":
+                # RESET clears displays, not the log: a marker every open stream
+                # sees, and the point a fresh stream replays from. Deleting the
+                # file here once wiped a day's events for every agent.
                 try:
-                    EVENTS.unlink(missing_ok=True)
+                    _append_events([{"kind": "reset", "ts": time.time()}])
                 except OSError:
                     pass
                 return self._send(200, b'{"ok":true}', "application/json")

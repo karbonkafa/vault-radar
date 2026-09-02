@@ -3,6 +3,7 @@
 
 Runs ``radar.py hook`` as a subprocess against a temporary vault, one payload per
 case, and compares the events it appends with what a reader of the graph should see.
+Then one ``radar.py serve`` on a free port, for what the viewer's RESET may touch.
 Payload shapes are the ones each agent actually sends: Claude Code (hooks reference),
 Kai (``agent/shell_hooks.py`` ``_serialize_payload`` plus its tools' JSON results),
 Kimi Code and Codex (observed in ``~/.vault-radar/events.jsonl``). Stdlib only.
@@ -37,6 +38,105 @@ def build_vault(root):
         os.makedirs(os.path.dirname(full), exist_ok=True)
         with open(full, "w", encoding="utf-8") as fh:
             fh.write(text)
+
+
+def server_checks(env, tv, events_path):
+    """RESET clears displays, never the shared log. Returns [(name, ok, detail)]."""
+    import socket
+    import time
+    import urllib.request
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    base = "http://127.0.0.1:%d" % port
+    err_path = os.path.join(os.path.dirname(events_path), "serve.err")
+    err_fh = open(err_path, "w")
+    proc = subprocess.Popen([sys.executable, RADAR, "serve", "--vault", tv, "--port", str(port), "--no-open"],
+                            env=env, stdout=subprocess.DEVNULL, stderr=err_fh)
+    results = []
+
+    def open_stream():
+        sock = socket.create_connection(("127.0.0.1", port), timeout=1.0)
+        sock.sendall(("GET /api/stream HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n\r\n" % port).encode())
+        return sock
+
+    def collect(sock, wait):
+        """The `data:` frames a stream delivers within `wait` seconds."""
+        buf, deadline = b"", time.time() + wait
+        sock.settimeout(0.2)
+        while time.time() < deadline:
+            try:
+                chunk = sock.recv(65536)
+            except socket.timeout:
+                continue
+            if not chunk:
+                break
+            buf += chunk
+        out = []
+        for line in buf.decode("utf-8", "replace").split("\n"):
+            if line.startswith("data: "):
+                try:
+                    out.append(json.loads(line[6:]))
+                except ValueError:
+                    pass
+        return out
+
+    try:
+        for _ in range(100):  # up to 5 s for the server to come up
+            try:
+                urllib.request.urlopen(base + "/api/vault", timeout=1.0).read()
+                break
+            except Exception:
+                time.sleep(0.05)
+        else:
+            err_fh.close()
+            return [("serve: starts on a free port", False, open(err_path).read()[-300:])]
+
+        seed = [json.dumps({"kind": "prompt", "text": "turn nine", "ts": time.time(), "session": "S9", "cwd": tv}),
+                json.dumps({"kind": "read", "path": os.path.join(tv, "notes/a.md"), "tool": "Read",
+                            "ts": time.time(), "session": "S9", "cwd": tv})]
+        with open(events_path, "a", encoding="utf-8") as fh:
+            fh.write("\n".join(seed) + "\n")
+        with open(events_path, encoding="utf-8") as fh:
+            before = fh.read()
+
+        sock = open_stream()
+        kinds = [(f.get("kind"), f.get("session")) for f in collect(sock, 1.0)]
+        sock.close()
+        results.append(("serve: a new stream replays the turn in progress",
+                        kinds == [("prompt", "S9"), ("read", "S9")], kinds))
+
+        watcher = open_stream()
+        collect(watcher, 1.0)  # drain its replay; what follows is live
+        resp = urllib.request.urlopen(
+            urllib.request.Request(base + "/api/reset", data=b"", method="POST"), timeout=2.0)
+        status = resp.status
+        after = None
+        if os.path.exists(events_path):
+            with open(events_path, encoding="utf-8") as fh:
+                after = fh.read()
+        results.append(("reset: the log is kept, nothing deleted",
+                        status == 200 and after is not None and after.startswith(before),
+                        "status=%s exists=%s" % (status, after is not None)))
+
+        seen = [f.get("kind") for f in collect(watcher, 2.0)]
+        watcher.close()
+        results.append(("reset: a stream that was open gets a reset frame", "reset" in seen, seen))
+
+        sock = open_stream()
+        got = [f.get("kind") for f in collect(sock, 1.0)]
+        sock.close()
+        results.append(("reset: a fresh stream replays nothing of the old turn",
+                        [k for k in got if k != "reset"] == [], got))
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        err_fh.close()
+    return results
 
 
 def main():
@@ -227,7 +327,13 @@ def main():
             print("   rc=%s out=%r err=%r" % (proc.returncode, proc.stdout, proc.stderr[-200:]))
             print("   expected:", json.dumps(exp, ensure_ascii=False))
             print("   got:     ", json.dumps(got, ensure_ascii=False))
-    print("\n%d cases, %d failed (%s)" % (len(cases), failures, RADAR))
+    server = server_checks(env, tv, events_path)
+    for name, ok, detail in server:
+        print(("PASS " if ok else "FAIL ") + name)
+        if not ok:
+            failures += 1
+            print("   got:     ", json.dumps(detail, ensure_ascii=False))
+    print("\n%d cases, %d failed (%s)" % (len(cases) + len(server), failures, RADAR))
     return 1 if failures else 0
 
 
