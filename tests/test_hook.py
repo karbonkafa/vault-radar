@@ -276,6 +276,25 @@ def main():
         ("Kai on_session_end", {"hook_event_name": "on_session_end", "tool_name": None, "tool_input": None,
                                 "session_id": "20260902_000000_kai", "cwd": tv, "extra": {"completed": True}},
          [{"kind": "stop"}]),
+        # -- `kai hooks doctor` / `kai hooks test` send kai_cli/hooks.py's _DEFAULT_PAYLOADS
+        #    through the real hook: session "test-session". A probe is not a turn. ----------
+        ("Kai doctor pre_llm_call (probe, no event)",
+         {"hook_event_name": "pre_llm_call", "tool_name": None, "tool_input": None, "session_id": "test-session",
+          "cwd": tv, "extra": {"user_message": "What is the weather?", "conversation_history": [],
+                               "is_first_turn": True, "model": "gpt-4", "platform": "cli"}},
+         []),
+        ("Kai doctor on_session_end (probe, no event)",
+         {"hook_event_name": "on_session_end", "tool_name": None, "tool_input": None, "session_id": "test-session",
+          "cwd": tv, "extra": {"task_id": "test-task", "turn_id": "test-turn", "completed": True, "failed": False,
+                               "interrupted": False, "turn_exit_reason": "text_response(stop)", "model": "gpt-4",
+                               "platform": "cli"}},
+         []),
+        ("Kai doctor post_tool_call (probe, no event)",
+         {"hook_event_name": "post_tool_call", "tool_name": "terminal", "tool_input": {"command": "echo hello"},
+          "session_id": "test-session", "cwd": tv,
+          "extra": {"task_id": "test-task", "tool_call_id": "test-call", "result": '{"output": "hello"}',
+                    "duration_ms": 42}},
+         []),
         # -- Kimi Code ---------------------------------------------------------------
         ("Kimi prompt as content blocks", {"hook_event_name": "UserPromptSubmit", "prompt": [{"type": "text", "text": "read the file please"}],
                                            "session_id": "session_kimi", "cwd": tv},
@@ -309,7 +328,7 @@ def main():
                 lines = [l for l in fh.read().split("\n")[before:] if l.strip()]
             for line in lines:
                 ev = json.loads(line)
-                for k in ("ts", "session", "cwd"):
+                for k in ("ts", "session", "cwd", "agent"):
                     ev.pop(k, None)
                 if "pattern" in ev:
                     ev["pattern"] = ev["pattern"][:30]

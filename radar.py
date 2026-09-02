@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """vault-radar — watch, in real time, which files your coding agent actually reads.
 
-Four subcommands:
+Five subcommands:
     radar.py hook              read a Claude Code hook event on stdin, append it to the log
     radar.py serve [options]   serve the live viewer at http://localhost:7777
+    radar.py window [options]  open the viewer already served on localhost
     radar.py install           print the settings.json snippet that wires the hook up
     radar.py follow [SESSION]  pin the viewer and the Obsidian plugin to one session
 
@@ -17,6 +18,8 @@ import json
 import os
 import re
 import shlex
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -29,6 +32,7 @@ HOME = Path(os.environ.get("VAULT_RADAR_HOME") or (Path.home() / ".vault-radar")
 EVENTS = HOME / "events.jsonl"
 UI_DIR = Path(__file__).resolve().parent / "ui"
 FOLLOW = HOME / "follow"
+THEMES_DIR = HOME / "themes"
 
 
 def _ratio(raw: str) -> float:
@@ -53,6 +57,8 @@ SCAN_TOOLS = {"Grep", "Glob"}
 
 def _extract(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Turn Claude, Codex, Kimi, or Kai hook payloads into radar events."""
+    if payload.get("session_id") == "test-session":
+        return []  # Kai's hook doctor/test probe is not a user turn.
     raw_event = payload.get("hook_event_name", "")
     event = {
         "post_tool_call": "PostToolUse",
@@ -317,28 +323,147 @@ def _append_events(events: List[Dict[str, Any]]) -> None:
         os.close(fd)
 
 
-def cmd_hook(_args: argparse.Namespace) -> int:
-    """Read one hook payload on stdin and append a radar event. Never blocks Claude."""
+# Cursor's before-hooks are gates: an observer must answer, or the agent waits on it.
+CURSOR_GATES = {"beforeReadFile", "beforeShellExecution", "beforeMCPExecution", "beforeTabFileRead"}
+
+
+def _reply(agent: Optional[str], event: Optional[str]) -> Optional[Dict[str, Any]]:
+    """What the calling agent expects on stdout. None means print nothing."""
+    if agent == "cursor":
+        if event in CURSOR_GATES:
+            return {"permission": "allow"}
+        if event == "beforeSubmitPrompt":
+            return {"continue": True}
+        if event == "stop":
+            return {}
+        return None
+    if agent == "antigravity":
+        return {}
+    return None
+
+
+def _say(reply: Optional[Dict[str, Any]]) -> None:
+    if reply is not None:
+        sys.stdout.write(json.dumps(reply))
+        sys.stdout.flush()
+
+
+def _guess_agent(payload: Dict[str, Any]) -> str:
+    """Which agent sent this payload, from its shape. `--agent` or VAULT_RADAR_AGENT win."""
+    if any(key in payload for key in ("toolCall", "conversationId", "invocationNum")):
+        return "antigravity"
+    if "conversation_id" in payload:
+        return "cursor"
+    raw = str(payload.get("hook_event_name") or "")
+    if raw in ("post_tool_call", "pre_llm_call", "on_session_end") or isinstance(payload.get("extra"), dict):
+        return "kai"
+    tool = str(payload.get("tool_name") or "").lower()
+    if tool in ("exec_command", "shell", "local_shell", "apply_patch"):
+        return "codex"
+    if (str(payload.get("session_id") or "").startswith("session_") or "tool_output" in payload
+            or isinstance(payload.get("prompt"), list)):
+        return "kimi"
+    return "claude"
+
+
+def _workspace(payload: Dict[str, Any]) -> str:
+    """The directory relative paths are anchored to: cwd, else the first workspace root."""
+    if isinstance(payload.get("cwd"), str) and payload["cwd"]:
+        return payload["cwd"]
+    for key in ("workspace_roots", "workspacePaths"):
+        roots = payload.get(key)
+        if isinstance(roots, list) and roots and isinstance(roots[0], str):
+            return roots[0]
+    return os.environ.get("CURSOR_PROJECT_DIR") or os.environ.get("CLAUDE_PROJECT_DIR") or ""
+
+
+def _from_cursor(payload: Dict[str, Any], event: str) -> List[Dict[str, Any]]:
+    """Cursor hooks (3.17): one payload per event, fields named per event."""
+    cwd = _workspace(payload)
+    if event == "beforeReadFile":
+        path = payload.get("file_path")
+        if not path:
+            return []
+        ev: Dict[str, Any] = {"kind": "read", "path": _absolute(str(path), cwd), "tool": event}
+        if isinstance(payload.get("content"), str):
+            ev["chars"] = len(payload["content"])  # what the agent is about to see
+        return [ev]
+    if event == "afterShellExecution":
+        output = payload.get("output") if isinstance(payload.get("output"), str) else ""
+        return _from_shell(str(payload.get("command") or ""), {"stdout": output}, cwd)
+    if event == "beforeSubmitPrompt":
+        return [{"kind": "prompt", "text": str(payload.get("prompt") or "")[:400]}]
+    if event == "stop":
+        return [{"kind": "stop"}]
+    return []
+
+
+def _from_antigravity(payload: Dict[str, Any], event: str) -> List[Dict[str, Any]]:
+    """Antigravity hooks (2.5): `toolCall` payloads carry the args but never the tool's output."""
+    cwd = _workspace(payload)
+    if event == "PreInvocation":
+        n = payload.get("invocationNum")
+        return [{"kind": "prompt", "text": "antigravity · invocation %s" % n if n is not None else "antigravity"}]
+    if event == "Stop":
+        return [{"kind": "stop"}]
+    if event != "PostToolUse":
+        return []
+    call = payload.get("toolCall") if isinstance(payload.get("toolCall"), dict) else {}
+    name = str(call.get("name") or "")
+    args = call.get("args") if isinstance(call.get("args"), dict) else {}
+    if name in ("view_file", "view_code_item", "view_file_outline"):
+        path = args.get("AbsolutePath") or args.get("File")
+        if not path:
+            return []
+        return [{"kind": "read", "path": _absolute(str(path), cwd), "tool": name}]
+    if name == "run_command":
+        return _from_shell(str(args.get("CommandLine") or ""), None, str(args.get("Cwd") or cwd))
+    if name in ("grep_search", "find_by_name", "codebase_search"):
+        pattern = args.get("Query") or args.get("Pattern") or ""
+        return [{"kind": "scan", "tool": name, "pattern": str(pattern), "hits": []}]  # no output in the payload
+    _note_tool(name)
+    return []
+
+
+def cmd_hook(args: argparse.Namespace) -> int:
+    """Read one hook payload on stdin and append a radar event. Never blocks the agent."""
+    agent = getattr(args, "agent", None) or os.environ.get("VAULT_RADAR_AGENT") or None
+    event = getattr(args, "event", None) or None
+    reply = _reply(agent, event)  # decided from the flags, so a bad payload still gets its answer
     try:
         payload = json.load(sys.stdin)
+        if not isinstance(payload, dict):
+            raise ValueError("payload is not an object")
     except Exception:
+        _say(reply)
         return 0  # a malformed payload must never break the agent's turn
 
     try:
-        events = _extract(payload)
-        if not events:
-            return 0
-        stamp = dict(ts=time.time(), session=payload.get("session_id", ""), cwd=payload.get("cwd", ""))
-        # A subagent's tool calls fire the same hooks and carry these two fields. The
-        # viewers draw those reads apart: they never entered the main context.
-        for key in ("agent_id", "agent_type"):
-            if payload.get(key):
-                stamp[key] = str(payload[key])
-        for event in events:
-            event.update(stamp)
-        _append_events(events)
+        agent = agent or _guess_agent(payload)
+        event = event or str(payload.get("hook_event_name") or "")
+        if reply is None:
+            reply = _reply(agent, event)
+        if agent == "cursor":
+            events = _from_cursor(payload, event)
+        elif agent == "antigravity":
+            events = _from_antigravity(payload, event)
+        else:
+            events = _extract(payload)
+        if events:
+            session = payload.get("session_id") or payload.get("conversation_id") or payload.get("conversationId") or ""
+            cwd = _workspace(payload) if agent in ("cursor", "antigravity") else payload.get("cwd", "")
+            stamp = dict(ts=time.time(), session=str(session), cwd=cwd, agent=agent)
+            # A subagent's tool calls fire the same hooks and carry these two fields. The
+            # viewers draw those reads apart: they never entered the main context.
+            for key in ("agent_id", "agent_type"):
+                if payload.get(key):
+                    stamp[key] = str(payload[key])
+            for ev in events:
+                ev.update(stamp)
+            _append_events(events)
     except Exception:
         pass  # radar is an observer; it is never allowed to fail loudly
+    _say(reply)
     return 0
 
 
@@ -548,6 +673,23 @@ def _is_loopback(hostport: str) -> bool:
     return host in LOOPBACK_HOSTS or host.startswith("127.")
 
 
+def load_themes() -> Dict[str, Dict[str, Any]]:
+    """Load user themes without letting names escape the theme directory."""
+    themes: Dict[str, Dict[str, Any]] = {}
+    if not THEMES_DIR.is_dir():
+        return themes
+    for path in sorted(THEMES_DIR.glob("*.json")):
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", path.stem):
+            continue
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(value, dict):
+            themes[path.stem] = value
+    return themes
+
+
 def make_handler(vault: Path, exts: List[str], alias: Optional[Path] = None):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -604,6 +746,10 @@ def make_handler(vault: Path, exts: List[str], alias: Optional[Path] = None):
                     },
                     ensure_ascii=False,
                 ).encode()
+                return self._send(200, body, "application/json; charset=utf-8")
+
+            if route == "/api/themes":
+                body = json.dumps(load_themes(), ensure_ascii=False).encode()
                 return self._send(200, body, "application/json; charset=utf-8")
 
             if route == "/api/stream":
@@ -754,6 +900,26 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_window(args: argparse.Namespace) -> int:
+    """Open the existing viewer without starting or owning a server."""
+    import urllib.error
+    import urllib.request
+
+    url = f"http://localhost:{args.port}"
+    try:
+        with urllib.request.urlopen(url + "/api/vault", timeout=args.timeout) as response:
+            status = response.status
+    except (OSError, urllib.error.URLError):
+        print(f"vault-radar server is not reachable at {url}", file=sys.stderr)
+        return 1
+    if status != 200:
+        print(f"vault-radar server at {url} returned HTTP {status}", file=sys.stderr)
+        return 1
+    open_window(url, args.width)
+    print(f"opened existing viewer: {url}")
+    return 0
+
+
 # ──────────────────────────────────────────── install
 
 
@@ -833,11 +999,262 @@ def cmd_follow(args: argparse.Namespace) -> int:
     return 0
 
 
+# ──────────────────────────────────────────── agents: who is hooked, who touches the vault
+
+HOOKED = HOME / "hooked.json"
+OFFERS = HOME / "offers.json"
+HOOK_PY = "/usr/bin/python3" if os.path.exists("/usr/bin/python3") else sys.executable
+SELF = str(Path(__file__).resolve())
+
+# lsof's command name -> agent surface. Runtimes (python, node) are not surfaces: Kai and
+# Claude Code run as those and are hooked already, so an unknown runtime is ignored.
+AGENT_PROCESSES = [
+    ("cursor", ("Cursor",)),
+    ("antigravity", ("Antigravity",)),
+    ("codex", ("Codex", "codex")),
+    ("vscode", ("Code", "Visual Studio Code")),
+    ("windsurf", ("Windsurf",)),
+    ("zed", ("zed", "Zed")),
+    ("claude", ("Claude",)),
+    ("kai", ("kai", "Kai")),
+    ("kimi", ("Kimi", "kimi")),
+]
+
+
+def _agent_of(command: str) -> Optional[str]:
+    for agent, names in AGENT_PROCESSES:
+        for name in names:
+            if re.match(r"^" + re.escape(name) + r"(?:\b|$)", command):
+                return agent
+    return None
+
+
+def _parse_lsof(text: str, vault: str) -> List[Dict[str, Any]]:
+    """`lsof -F pcn` output -> one entry per agent surface with the vault files it holds open."""
+    vault = os.path.normpath(os.path.expanduser(vault))
+    found: Dict[str, Dict[str, Any]] = {}
+    pid: Optional[int] = None
+    command = ""
+    for line in text.splitlines():
+        if not line:
+            continue
+        tag, value = line[0], line[1:]
+        if tag == "p":
+            pid = int(value) if value.isdigit() else None
+            command = ""
+        elif tag == "c":
+            command = value
+        elif tag == "n" and pid is not None:
+            path = os.path.normpath(value)
+            if not path.startswith(vault + os.sep):
+                continue
+            if path[len(vault) + 1:].split(os.sep)[0] in (".git", ".obsidian"):
+                continue
+            agent = _agent_of(command)
+            if not agent:
+                continue
+            entry = found.setdefault(agent, {"agent": agent, "pid": pid, "command": command, "files": []})
+            if path not in entry["files"]:
+                entry["files"].append(path)
+    return list(found.values())
+
+
+def _lsof_vault(vault: str) -> List[Dict[str, Any]]:
+    try:
+        proc = subprocess.run(["lsof", "+D", os.path.expanduser(vault), "-F", "pcn"],
+                              capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    return _parse_lsof(proc.stdout, vault)  # lsof exits 1 when nothing is open; that is not an error
+
+
+def _load_json(path: Path, default: Any) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return default
+
+
+def _dump_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _hooked() -> Dict[str, Any]:
+    reg = _load_json(HOOKED, {})
+    agents = reg.get("agents") if isinstance(reg, dict) else None
+    return agents if isinstance(agents, dict) else {}
+
+
+def _notify(title: str, text: str) -> None:
+    try:
+        subprocess.run(["osascript", "-e", 'display notification "%s" with title "%s"'
+                        % (text.replace('"', "'"), title.replace('"', "'"))],
+                       capture_output=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def _offer(found: List[Dict[str, Any]], checks_dir: Path, notify: bool) -> int:
+    """One draft kaiChecks item per unhooked surface seen holding vault files. Asked once."""
+    hooked = _hooked()
+    offers = _load_json(OFFERS, {})
+    offered = offers.get("offered") if isinstance(offers, dict) and isinstance(offers.get("offered"), dict) else {}
+    program_path = checks_dir / "radar-hook-coverage.json"
+    program = _load_json(program_path, None)
+    if not isinstance(program, dict) or not isinstance(program.get("items"), list):
+        program = {"program": "Radar hook kapsamı: bütün ajanlar ve modeller",
+                   "source": "radar.py agents offer — vault dosyası açık tutan hook'suz ajanlar", "items": []}
+    new: List[str] = []
+    for entry in found:
+        agent = entry.get("agent") if isinstance(entry, dict) else None
+        if not agent or agent in hooked or agent in offered:
+            continue
+        files = [str(f) for f in (entry.get("files") or [])]
+        stamp = time.strftime("%Y-%m-%d %H:%M")
+        recipe = ("`%s hook-install %s`" % (SELF, agent)) if agent in RECIPES else "tarif yok, elle bağlanır"
+        program["items"].append({
+            "id": "offer-" + agent,
+            "title": "%s vault'u kullanıyor — hook'lansın mı?" % agent,
+            "criterion": "%s: %s (pid %s) vault'ta %d dosya açık tuttu: %s. Onay verilirse %s koşar ve olay üretimi "
+                         "sondayla doğrulanır; reddedilirse bu madde silinir, ~/.vault-radar/offers.json kaydı kalır ve bir daha sorulmaz."
+                         % (stamp, entry.get("command", ""), entry.get("pid"), len(files), ", ".join(files[:3]), recipe),
+            "state": "draft", "at": time.strftime("%Y-%m-%d"), "by": "radar.py agents offer",
+            "priority": len(program["items"]) + 1,
+        })
+        offered[agent] = {"at": stamp, "pid": entry.get("pid"), "command": entry.get("command"), "files": files[:10]}
+        new.append(agent)
+    if new:
+        _dump_json(program_path, program)
+        _dump_json(OFFERS, {"version": 1, "offered": offered})
+        if notify:
+            _notify("vault-radar", "%s vault'u kullanıyor ama hook'lu değil — kaiChecks'te soru var" % ", ".join(new))
+    print(json.dumps({"offered": new}))
+    return 0
+
+
+def _recipe_cursor(existing: Any) -> Dict[str, Any]:
+    cfg = existing if isinstance(existing, dict) else {}
+    cfg.setdefault("version", 1)
+    hooks = cfg.get("hooks") if isinstance(cfg.get("hooks"), dict) else {}
+    cfg["hooks"] = hooks
+    for event in ("beforeReadFile", "afterShellExecution", "beforeSubmitPrompt", "stop"):
+        entries = hooks.get(event) if isinstance(hooks.get(event), list) else []
+        hooks[event] = entries
+        if not any(isinstance(h, dict) and "radar.py hook --agent cursor" in str(h.get("command", "")) for h in entries):
+            entries.append({"command": "%s %s hook --agent cursor --event %s" % (HOOK_PY, SELF, event), "timeout": 5})
+    return cfg
+
+
+def _recipe_antigravity(existing: Any) -> Dict[str, Any]:
+    cfg = existing if isinstance(existing, dict) else {}
+
+    def handler(event: str) -> Dict[str, Any]:
+        return {"type": "command", "command": "%s %s hook --agent antigravity --event %s" % (HOOK_PY, SELF, event), "timeout": 5}
+
+    cfg["vault-radar"] = {"enabled": True,
+                          "PostToolUse": [{"matcher": "*", "hooks": [handler("PostToolUse")]}],
+                          "PreInvocation": [handler("PreInvocation")],
+                          "Stop": [handler("Stop")]}
+    return cfg
+
+
+RECIPES = {"cursor": ("~/.cursor/hooks.json", _recipe_cursor),
+           "antigravity": ("~/.gemini/config/hooks.json", _recipe_antigravity)}
+MANUAL = {"claude": "~/.claude/settings.json — `radar.py install` prints the snippet",
+          "kai": "~/.kai/config.yaml hooks:",
+          "codex": "~/.codex/hooks.json",
+          "kimi": "~/.kimi-code/config.toml [[hooks]]"}
+
+
+def cmd_agents(args: argparse.Namespace) -> int:
+    checks_dir = Path(os.path.expanduser(args.checks_dir))
+    if args.what == "classify":
+        if not args.vault:
+            print("--vault is required", file=sys.stderr)
+            return 2
+        print(json.dumps(_parse_lsof(sys.stdin.read(), args.vault), ensure_ascii=False))
+        return 0
+    if args.what == "offer":
+        try:
+            found = json.loads(sys.stdin.read() or "[]")
+        except ValueError:
+            found = []
+        return _offer(found if isinstance(found, list) else [], checks_dir, notify=not args.no_notify)
+    if args.what == "watch":
+        if not args.vault:
+            print("--vault is required", file=sys.stderr)
+            return 2
+        return _offer(_lsof_vault(args.vault), checks_dir, notify=not args.no_notify)
+    if args.what == "install-watch":
+        if not args.vault:
+            print("--vault is required", file=sys.stderr)
+            return 2
+        plist = Path.home() / "Library" / "LaunchAgents" / "ai.karbon.vault-radar-watch.plist"
+        prog = [HOOK_PY, SELF, "agents", "watch", "--vault", os.path.expanduser(args.vault), "--checks-dir", str(checks_dir)]
+        body = ("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+                "<plist version=\"1.0\"><dict>\n<key>Label</key><string>ai.karbon.vault-radar-watch</string>\n"
+                "<key>ProgramArguments</key><array>\n" + "".join("<string>%s</string>\n" % a for a in prog) + "</array>\n"
+                "<key>StartInterval</key><integer>300</integer>\n<key>RunAtLoad</key><true/>\n"
+                "<key>StandardOutPath</key><string>%s</string>\n<key>StandardErrorPath</key><string>%s</string>\n"
+                "</dict></plist>\n" % (HOME / "watch.log", HOME / "watch.log"))
+        plist.parent.mkdir(parents=True, exist_ok=True)
+        plist.write_text(body, encoding="utf-8")
+        print("wrote %s\nload with: launchctl bootstrap gui/$(id -u) %s" % (plist, plist))
+        return 0
+    return 2
+
+
+def cmd_hook_install(args: argparse.Namespace) -> int:
+    if args.list:
+        reg = _hooked()
+        for agent in sorted(set(reg) | set(RECIPES) | set(MANUAL)):
+            where = reg.get(agent, {}).get("config") or (RECIPES[agent][0] if agent in RECIPES else MANUAL.get(agent, ""))
+            print("%-12s %-11s %s" % (agent, "hooked" if agent in reg else "not hooked", where))
+        return 0
+    agent = args.agent
+    if not agent:
+        print("agent name or --list required", file=sys.stderr)
+        return 2
+    if agent in RECIPES:
+        default_path, recipe = RECIPES[agent]
+        path = Path(os.path.expanduser(args.config or default_path))
+        existing = _load_json(path, None)
+        new = recipe(json.loads(json.dumps(existing)) if isinstance(existing, dict) else None)
+        if isinstance(existing, dict) and json.dumps(new, sort_keys=True) == json.dumps(existing, sort_keys=True):
+            print("%s: already installed at %s" % (agent, path))
+        else:
+            if path.exists():
+                backup = path.with_name(path.name + ".bak-" + time.strftime("%Y%m%d-%H%M%S"))
+                shutil.copy2(path, backup)
+                print("backup: %s" % backup)
+            _dump_json(path, new)
+            print("%s: hook config written to %s" % (agent, path))
+        reg = _load_json(HOOKED, {})
+        agents = reg.get("agents") if isinstance(reg, dict) and isinstance(reg.get("agents"), dict) else {}
+        entry = agents.get(agent) if isinstance(agents.get(agent), dict) else {}
+        entry.update({"config": str(path), "since": entry.get("since") or time.strftime("%Y-%m-%dT%H:%M"),
+                      "verified": entry.get("verified") or "config written, no live probe yet"})
+        agents[agent] = entry
+        _dump_json(HOOKED, {"version": 1, "agents": agents})
+        return 0
+    if agent in MANUAL:
+        print("%s: %s — %s" % (agent, "hooked" if agent in _hooked() else "not hooked", MANUAL[agent]))
+        return 0
+    print("unknown agent %r; known: %s" % (agent, ", ".join(sorted(set(RECIPES) | set(MANUAL)))), file=sys.stderr)
+    return 2
+
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="radar", description=__doc__)
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("hook", help="consume one hook payload on stdin").set_defaults(fn=cmd_hook)
+    hook = sub.add_parser("hook", help="consume one hook payload on stdin")
+    hook.add_argument("--agent", help="who is calling: claude | kai | kimi | codex | cursor | antigravity (guessed from the payload when omitted)")
+    hook.add_argument("--event", help="the hook event, for agents whose payload does not name it (Antigravity) or whose reply depends on it (Cursor)")
+    hook.set_defaults(fn=cmd_hook)
 
     serve = sub.add_parser("serve", help="serve the live viewer")
     serve.add_argument("--vault", required=True, help="directory to watch")
@@ -847,6 +1264,12 @@ def main() -> int:
     serve.add_argument("--width", type=int, default=520, help="docked window width (default: 520)")
     serve.set_defaults(fn=cmd_serve)
 
+    window = sub.add_parser("window", help="open the viewer from an already-running server")
+    window.add_argument("--port", type=int, default=7777, help="existing viewer port (default: 7777)")
+    window.add_argument("--width", type=int, default=520, help="docked window width (default: 520)")
+    window.add_argument("--timeout", type=float, default=2.0, help="health-check timeout in seconds")
+    window.set_defaults(fn=cmd_window)
+
     sub.add_parser("install", help="print the settings.json snippet").set_defaults(fn=cmd_install)
 
     follow = sub.add_parser("follow", help="pin the viewer and the Obsidian plugin to one session")
@@ -854,6 +1277,20 @@ def main() -> int:
     follow.add_argument("--last", action="store_true", help="pin to the session that prompted last")
     follow.add_argument("--off", action="store_true", help="follow the last prompt again (default)")
     follow.set_defaults(fn=cmd_follow)
+
+    agents = sub.add_parser("agents", help="who holds vault files open, who is hooked; offer to hook the rest")
+    agents.add_argument("what", choices=["classify", "offer", "watch", "install-watch"])
+    agents.add_argument("--vault", help="vault root (classify, watch, install-watch)")
+    agents.add_argument("--checks-dir", default=str(Path(os.environ.get("KAI_HOME") or "~/.kai").expanduser() / "checks"),
+                        help="where the kaiChecks programme files live")
+    agents.add_argument("--no-notify", action="store_true", help="no macOS notification on a new offer")
+    agents.set_defaults(fn=cmd_agents)
+
+    install = sub.add_parser("hook-install", help="write an agent's radar hook config, idempotently")
+    install.add_argument("agent", nargs="?", help="cursor | antigravity (recipes); claude | kai | codex | kimi (manual)")
+    install.add_argument("--config", help="config file to write instead of the agent's default")
+    install.add_argument("--list", action="store_true", help="print the registry")
+    install.set_defaults(fn=cmd_hook_install)
 
     args = parser.parse_args()
     return args.fn(args)
