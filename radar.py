@@ -892,7 +892,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
     url = f"http://localhost:{args.port}"
     print(f"open   : {url}")
     if not args.no_open:
-        threading.Timer(0.6, open_window, args=(url, args.width)).start()
+        threading.Timer(0.6, open_window, args=(viewer_url(args.port), args.width)).start()
         print("        (opening a docked window — pass --no-open to skip)")
     try:
         server.serve_forever()

@@ -54,6 +54,7 @@ def run_main(*args: str):
 
 def main() -> int:
     failures = 0
+    cases = 0
     import tempfile as _tempfile
     bare_home = Path(_tempfile.mkdtemp(prefix="vault-radar-bare-"))
     port = free_port()
@@ -65,6 +66,7 @@ def main() -> int:
             code, stdout, stderr = run_main("window", "--port", str(port), "--width", "640")
         expected_url = f"http://localhost:{port}"
         ok = code == 0 and not stderr and expected_url in stdout and opened.call_args_list == [mock.call(expected_url, 640)]
+        cases += 1
         print(("PASS" if ok else "FAIL") + " window opens the healthy existing server")
         if not ok:
             failures += 1
@@ -78,6 +80,7 @@ def main() -> int:
     with mock.patch.object(RADAR, "open_window") as opened:
         code, stdout, stderr = run_main("window", "--port", str(port))
     ok = code == 1 and not stdout and "not reachable" in stderr and not opened.called
+    cases += 1
     print(("PASS" if ok else "FAIL") + " window refuses when no server is listening")
     if not ok:
         failures += 1
@@ -91,6 +94,7 @@ def main() -> int:
         code, stdout, stderr = run_main("theme", "sonar")
         recorded = (home / "theme").read_text(encoding="utf-8").strip() if (home / "theme").exists() else None
         ok = code == 0 and not stderr and recorded == "sonar" and "sonar" in stdout
+        cases += 1
         print(("PASS" if ok else "FAIL") + " theme: records a built-in name in <home>/theme")
         if not ok:
             failures += 1
@@ -99,6 +103,7 @@ def main() -> int:
         code, stdout, stderr = run_main("theme", "no-such-theme")
         recorded = (home / "theme").read_text(encoding="utf-8").strip() if (home / "theme").exists() else None
         ok = code == 1 and "no-such-theme" in stderr and recorded == "sonar"
+        cases += 1
         print(("PASS" if ok else "FAIL") + " theme: refuses an unknown name and keeps the old one")
         if not ok:
             failures += 1
@@ -106,6 +111,7 @@ def main() -> int:
 
         code, stdout, stderr = run_main("theme")
         ok = code == 0 and stdout.strip() == "sonar"
+        cases += 1
         print(("PASS" if ok else "FAIL") + " theme: with no name prints the recorded one")
         if not ok:
             failures += 1
@@ -120,6 +126,7 @@ def main() -> int:
                 code, stdout, stderr = run_main("window", "--port", str(port))
             expected_url = f"http://localhost:{port}/?theme=sonar"
             ok = code == 0 and opened.call_args_list == [mock.call(expected_url, 520)]
+            cases += 1
             print(("PASS" if ok else "FAIL") + " window: opens the viewer on the recorded theme")
             if not ok:
                 failures += 1
@@ -129,7 +136,7 @@ def main() -> int:
             server.server_close()
             thread.join(timeout=2)
 
-    print(f"\n2 cases, {failures} failed ({Path(__file__).resolve()})")
+    print(f"\n{cases} cases, {failures} failed ({Path(__file__).resolve()})")
     return 1 if failures else 0
 
 
