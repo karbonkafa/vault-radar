@@ -54,6 +54,7 @@ Three moving parts, no magic:
 1. **A hook.** Claude Code fires `PostToolUse` after every tool call. `radar.py hook`
    reads the payload on stdin and appends one JSON line to `~/.vault-radar/events.jsonl`.
    It catches `Read`, `Grep`, `Glob` and `Bash` (agents that `cat` or `grep` from the shell are tracked too), plus `UserPromptSubmit` and `Stop`.
+   A shell `cat`/`head`/`sed` counts every file it names; a shell `grep`/`rg` takes its hits from the command's own output.
 2. **A server.** `radar.py serve` indexes your vault once (path, size, token estimate)
    and tails the event log, pushing each new line over Server-Sent Events.
 3. **A viewer.** A single HTML file. Every file in your vault is one row; rows light
@@ -142,8 +143,9 @@ radar.py serve --vault ~/notes --port 7777 --ext .md,.txt
 | `VAULT_RADAR_HOME` | `~/.vault-radar` | where the event log lives |
 | `VAULT_RADAR_CPT` | `3.8` | characters per token (≈4.0 English, ≈3.6 Turkish) |
 
-Token counts are **estimates from file size**, not real tokenizer output. They are
-there for proportion, not for billing.
+Token counts are **estimates**: from the bytes the tool actually returned when the
+payload carries them (a partial `Read`, a `head -40`), otherwise from file size. Not
+real tokenizer output; there for proportion, not for billing.
 
 ## Demo mode
 
@@ -153,8 +155,10 @@ wiring hooks up.
 
 ## Limitations
 
-- Reads are attributed by filename, so two files with the same relative path in
-  different roots can collide.
+- Reads are attributed by vault root (the resolved path and the one given to
+  `--vault`); an absolute path under neither is reported as outside. Only relative
+  paths, which the hook emits when a payload carries no `cwd`, fall back to suffix
+  matching, and never on the bare filename alone.
 - `Grep` hit extraction is best-effort: it parses the tool response, whose exact
   shape is not part of any public contract and may change.
 - Single session at a time. Two concurrent Claude Code sessions write to the same

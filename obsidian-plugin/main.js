@@ -42,6 +42,7 @@ module.exports = class VaultRadarPlugin extends Plugin {
     this.activePath = null;
     this.session = null;
     this.readTokens = 0;
+    this.readTk = new Map();     // relative path -> tokens counted for it this turn
     this.offset = 0;
 
     this.status = this.addStatusBarItem();
@@ -146,6 +147,7 @@ module.exports = class VaultRadarPlugin extends Plugin {
       this.botAt = null;
       if (this.settings.fadeOnPrompt) this.clearMarks(false);
       this.readTokens = 0;
+      this.readTk.clear();
       this.status.setText('radar: ' + String(ev.text || '').slice(0, 34));
       return;
     }
@@ -162,7 +164,13 @@ module.exports = class VaultRadarPlugin extends Plugin {
       this.marks.set(rel, 'read');
       this.activePath = rel;
       this.walkTo(rel);
-      this.readTokens += this.estimateTokens(rel);
+      // Count what the tool returned when the hook saw it — a partial Read is partial
+      // context. Partial reads add up, capped at the whole file.
+      const full = this.estimateTokens(rel);
+      const got = (ev.chars != null && isFinite(ev.chars)) ? Math.round(ev.chars / 3.8) : full;
+      this.readTk.set(rel, Math.min(full, (this.readTk.get(rel) || 0) + got));
+      this.readTokens = 0;
+      for (const v of this.readTk.values()) this.readTokens += v;
       const n = [...this.marks.values()].filter((v) => v === 'read').length;
       this.status.setText(`radar: ${n} files · ~${this.readTokens.toLocaleString()} tk`);
       return;
@@ -177,22 +185,41 @@ module.exports = class VaultRadarPlugin extends Plugin {
     return f && f.stat ? Math.round(f.stat.size / 3.8) : 0;
   }
 
-  /** Map an absolute path from the log onto a vault-relative path, or null. */
+  /** Map a path from the log onto a vault-relative path, or null. */
   toRelative(p) {
     if (!p) return null;
-    let base = '';
-    try { base = this.app.vault.adapter.getBasePath(); } catch (_) { base = ''; }
-    if (base && p.startsWith(base)) {
-      const rel = p.slice(base.length).replace(/^[/\\]+/, '');
-      if (this.app.vault.getAbstractFileByPath(rel)) return rel;
+    p = String(p);
+    for (const base of this.vaultRoots()) {
+      if (p.startsWith(base + '/') || p.startsWith(base + '\\')) {
+        const rel = p.slice(base.length + 1).split('\\').join('/');
+        return this.app.vault.getAbstractFileByPath(rel) ? rel : null;
+      }
     }
-    // fall back to longest matching suffix — handles symlinks and nested roots
+    // An absolute path outside the vault is outside — no suffix fallback. Matching
+    // the bare filename lit this vault's README.md for every other repo's README.md.
+    if (path.isAbsolute(p)) return null;
+    // Relative (the hook had no cwd): longest suffix of at least two components.
     const parts = p.split(/[/\\]/);
-    for (let i = 0; i < parts.length; i++) {
+    for (let i = 0; i < parts.length - 1; i++) {
       const cand = parts.slice(i).join('/');
       if (this.app.vault.getAbstractFileByPath(cand)) return cand;
     }
-    return null;
+    return parts.length === 1 && this.app.vault.getAbstractFileByPath(p) ? p : null;
+  }
+
+  /** The vault's base path as Obsidian reports it, plus its symlink-resolved form. */
+  vaultRoots() {
+    if (this._roots) return this._roots;
+    const roots = [];
+    try {
+      const base = this.app.vault.adapter.getBasePath();
+      if (base) {
+        roots.push(base.replace(/[/\\]+$/, ''));
+        try { roots.push(fs.realpathSync(base).replace(/[/\\]+$/, '')); } catch (_) { /* ignore */ }
+      }
+    } catch (_) { /* not a desktop adapter */ }
+    this._roots = [...new Set(roots)];
+    return this._roots;
   }
 
 

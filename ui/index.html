@@ -85,7 +85,7 @@ const $=id=>document.getElementById(id);
 const cursor=()=>{const s=document.createElement('span');s.className='cur';return s;};
 function setPrompt(t){const q=$('pq');q.textContent=String(t==null?'':t);q.appendChild(cursor());}
 const cv=$('cv'), cx=cv.getContext('2d');
-let N=[], E=[], byPath={}, TOTAL=0, readTk=0, outN=0, ACTIVE=null, timer=null, es=null;
+let N=[], E=[], byPath={}, ROOTS=[], CPT=3.8, TOTAL=0, readTk=0, outN=0, ACTIVE=null, timer=null, es=null;
 let agent={x:0,y:0,tx:0,ty:0,on:false,t:1,from:null,to:null,trail:[]};
 let W=0,H=0,DPR=1;
 
@@ -183,31 +183,47 @@ const STILL=new URLSearchParams(location.search).get('still');
 function loop(){ if(STILL)return; tick(); moveAgent(); draw(); requestAnimationFrame(loop); }
 function settle(steps){ for(let i=0;i<steps;i++)tick(); moveAgent(); draw(); }
 
-function build(files,edges,total){
-  N=files.map(f=>({label:f.path,tokens:f.tokens,st:null,x:0,y:0,vx:0,vy:0}));
+function build(files,edges,total,roots,cpt){
+  N=files.map(f=>({label:f.path,tokens:f.tokens,rt:0,st:null,x:0,y:0,vx:0,vy:0}));
   byPath={}; N.forEach((n,i)=>byPath[n.label]=i);
+  ROOTS=[...new Set((roots||[]).filter(Boolean).map(r=>String(r).replace(/[\\/]+$/,'')))];
+  CPT=cpt>0?cpt:3.8;
   E=edges||[]; TOTAL=total; readTk=0; outN=0;
   $('mt').textContent=total.toLocaleString('tr-TR');
   $('mr').textContent='0'; $('mx').textContent='—'; $('bar').style.width='0%'; $('out').textContent='';
   resize(); seed();
 }
 function clearTurn(){
-  N.forEach(n=>n.st=null); readTk=0; outN=0; agent.trail=[]; agent.toNode=null;
+  N.forEach(n=>{n.st=null;n.rt=0}); readTk=0; outN=0; agent.trail=[]; agent.toNode=null;
   $('mr').textContent='0'; $('mx').textContent='—'; $('bar').style.width='0%';
   $('out').textContent=''; $('now').textContent='';
 }
-function rel(p){ const parts=p.split('/');
-  for(let i=0;i<parts.length;i++){ const c=parts.slice(i).join('/'); if(byPath[c]!==undefined)return c; }
-  return null; }
+// Exact vault root first: the resolved path and the one typed at --vault, for a
+// symlinked vault. An absolute path under neither is outside, full stop — falling
+// back to the bare filename lit this vault's README.md whenever any other repo's
+// README.md was read. Suffix matching stays for relative paths only (no cwd in
+// the payload), and never on the bare name alone.
+function rel(p){ p=String(p==null?'':p);
+  for(const r of ROOTS){ if(p.startsWith(r+'/')){ const c=p.slice(r.length+1); return byPath[c]!==undefined?c:null; } }
+  if(p.startsWith('/')||/^[A-Za-z]:[\\/]/.test(p)) return null;
+  const parts=p.split('/');
+  for(let i=0;i<parts.length-1;i++){ const c=parts.slice(i).join('/'); if(byPath[c]!==undefined)return c; }
+  return parts.length===1&&byPath[p]!==undefined?p:null; }
 function goTo(idx,label){
   const n=N[idx]; if(!n)return;
   agent.from={x:agent.x,y:agent.y}; if(!agent.on){agent.from={x:W/2,y:-20}; agent.on=true;}
   agent.to=n; agent.toNode=n; agent.t=0;
   $('now').textContent=label+' · '+n.label;
 }
-function markRead(idx){
+// `chars` is what the tool returned when the hook saw it: a 40-line Read of a
+// 2,000-line file is 40 lines of context, not the file. Partial reads add up,
+// capped at the whole file; without `chars` the whole file is assumed.
+function markRead(idx,chars){
   const n=N[idx]; if(!n)return;
-  if(n.st!=='read'){ n.st='read'; readTk+=n.tokens; }
+  n.st='read';
+  const t=(chars!=null&&isFinite(chars))?Math.round(chars/CPT):n.tokens;
+  n.rt=Math.min(n.tokens,n.rt+t);
+  readTk=N.reduce((a,m)=>a+(m.rt||0),0);
   $('mr').textContent=readTk.toLocaleString('tr-TR');
   $('bar').style.width=Math.min(100,readTk/Math.max(1,TOTAL)*100)+'%';
   $('mx').textContent=readTk?(TOTAL/readTk).toFixed(1).replace('.',',')+'×':'—';
@@ -229,7 +245,7 @@ function handle(ev){
       const b=document.createElement('b'); b.textContent=outN; o.appendChild(b);
       o.appendChild(document.createTextNode(' · '+String(ev.path==null?'':ev.path).split('/').slice(-2).join('/')));
       return; }
-    const i=byPath[p]; goTo(i,'read'); setTimeout(()=>markRead(i),520); return;
+    const i=byPath[p]; goTo(i,'read'); setTimeout(()=>markRead(i,ev.chars),520); return;
   }
   if(ev.kind==='stop'){ $('now').textContent=''; agent.toNode=null; }
 }
@@ -266,7 +282,7 @@ document.querySelectorAll('[data-t]').forEach(el=>{const k=el.dataset.t;
   el.textContent=T[k]; if(c)el.appendChild(c);});
 function live(){
   fetch('/api/vault').then(r=>r.json()).then(d=>{
-    build(d.files,d.edges,d.total_tokens);
+    build(d.files,d.edges,d.total_tokens,[d.root,d.root_alias],d.cpt);
     $('st').className='st live'; $('stx').textContent=T.live;
     if(es)es.close();
     es=new EventSource('/api/stream');

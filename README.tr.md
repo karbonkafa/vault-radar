@@ -56,8 +56,9 @@ Tarayıcı penceresini ekranın sağ yarısına park et ve her zamanki gibi çal
 
 1. **Bir hook.** Claude Code her tool çağrısından sonra `PostToolUse` tetikliyor.
    `radar.py hook` stdin'den gelen payload'ı okuyup `~/.vault-radar/events.jsonl`
-   dosyasına tek satırlık bir JSON ekliyor. `Read`, `Grep`, `Glob` ile birlikte
-   `UserPromptSubmit` ve `Stop` olaylarını yakalıyor.
+   dosyasına tek satırlık bir JSON ekliyor. `Read`, `Grep`, `Glob` ve `Bash` ile birlikte
+   `UserPromptSubmit` ve `Stop` olaylarını yakalıyor. Kabuktan `cat`/`head`/`sed` ile
+   okunan her dosya sayılır; kabuk `grep`/`rg` eşleşmelerini komutun kendi çıktısından alır.
 2. **Bir sunucu.** `radar.py serve` vault'unu bir kez indeksliyor (yol, boyut,
    tahmini token) ve olay log'unu takip edip her yeni satırı Server-Sent Events
    üzerinden gönderiyor.
@@ -148,8 +149,9 @@ radar.py serve --vault ~/notes --port 7777 --ext .md,.txt
 | `VAULT_RADAR_HOME` | `~/.vault-radar` | olay log'unun tutulduğu yer |
 | `VAULT_RADAR_CPT` | `3.8` | token başına karakter (≈4.0 İngilizce, ≈3.6 Türkçe) |
 
-Token sayıları gerçek tokenizer çıktısı değil, **dosya boyutundan tahmin**. Oran
-fikri versinler diye varlar, faturalandırma için değil.
+Token sayıları gerçek tokenizer çıktısı değil, **tahmin**: tool'un gerçekten döndürdüğü
+bayt sayısı payload'da varsa ondan (kısmi `Read`, `head -40`), yoksa dosya boyutundan.
+Oran fikri versinler diye varlar, faturalandırma için değil.
 
 ## Demo modu
 
@@ -159,8 +161,10 @@ arayüzü denemek için kullanışlı.
 
 ## Sınırlar
 
-- Okumalar dosya adına göre eşleştiriliyor, yani farklı köklerdeki aynı göreli
-  yola sahip iki dosya çakışabilir.
+- Okumalar vault köküne göre eşleştiriliyor (çözümlenmiş yol ve `--vault`a verilen
+  yol); ikisinin de altında olmayan mutlak yol vault dışı sayılır. Yalnız göreli yollar,
+  yani payload'da `cwd` yokken hook'un ürettiği yollar, sonek eşleşmesine düşer ve
+  hiçbir zaman çıplak dosya adıyla eşleşmez.
 - `Grep` eşleşmelerinin çıkarılması elden geldiğince yapılıyor: tool cevabı
   ayrıştırılıyor ve o cevabın tam biçimi hiçbir public sözleşmenin parçası değil,
   değişebilir.

@@ -15,6 +15,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import sys
 import threading
 import time
@@ -47,72 +48,120 @@ SCAN_TOOLS = {"Grep", "Glob"}
 # ──────────────────────────────────────────── hook
 
 
-def _extract(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Turn a raw hook payload into a radar event, or None if uninteresting."""
+def _extract(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Turn a raw hook payload into radar events: usually one, none if uninteresting."""
     event = payload.get("hook_event_name", "")
     tool = payload.get("tool_name", "")
     tin = payload.get("tool_input") or {}
+    cwd = payload.get("cwd") or ""
 
     if event == "UserPromptSubmit":
-        return {"kind": "prompt", "text": (payload.get("prompt") or "")[:400]}
+        return [{"kind": "prompt", "text": (payload.get("prompt") or "")[:400]}]
 
     if event == "Stop":
-        return {"kind": "stop"}
+        return [{"kind": "stop"}]
 
     if event != "PostToolUse":
-        return None
+        return []
 
     if tool in READ_TOOLS or tool.lower() in {"readfile", "view", "opendocument"}:
         path = tin.get("file_path") or tin.get("notebook_path")
         if not path:
-            return None
-        return {"kind": "read", "path": path, "tool": tool}
+            return []
+        ev = {"kind": "read", "path": _absolute(path, cwd), "tool": tool}
+        chars = _returned_chars(payload.get("tool_response"))
+        if chars is not None:
+            ev["chars"] = chars  # what actually entered the context: an offset/limit Read is partial
+        return [ev]
 
     if tool == "Bash":
-        return _from_shell(tin.get("command") or "")
+        return _from_shell(tin.get("command") or "", payload.get("tool_response"), cwd)
 
     if tool in SCAN_TOOLS or tool.lower() in {"search", "codesearch"}:
-        hits = _scan_hits(payload.get("tool_response"))
-        return {
-            "kind": "scan",
-            "tool": tool,
-            "pattern": tin.get("pattern") or tin.get("glob") or "",
-            "hits": hits,
-        }
+        return [
+            {
+                "kind": "scan",
+                "tool": tool,
+                "pattern": tin.get("pattern") or tin.get("glob") or "",
+                "hits": _scan_hits(payload.get("tool_response"), cwd),
+            }
+        ]
 
     _note_tool(tool)
+    return []
+
+
+def _absolute(path: str, cwd: str) -> str:
+    """Anchor a path the way the shell would have: ~ and $VARS expanded, relative to cwd."""
+    p = os.path.expandvars(os.path.expanduser(path))
+    if cwd and not os.path.isabs(p):
+        p = os.path.join(cwd, p)
+    return os.path.normpath(p)
+
+
+def _returned_chars(response: Any) -> Optional[int]:
+    """Size of the content the Read tool handed back, if the response carries it."""
+    if isinstance(response, dict):
+        inner = response.get("file")
+        if isinstance(inner, dict) and isinstance(inner.get("content"), str):
+            return len(inner["content"])
     return None
 
 
-_SHELL_READ = re.compile(r"\b(?:cat|bat|head|tail|less|more)\b\s+((?:[^|;&<>\n]+))")
+_SHELL_READ = re.compile(r"\b(?:cat|bat|head|tail|less|more|sed)\b\s+([^|;&<>\n]+)")
 _SHELL_SCAN = re.compile(r"\b(?:rg|grep|ag|ack|fd|find)\b")
 
 
-def _from_shell(command: str) -> Optional[Dict[str, Any]]:
+def _from_shell(command: str, response: Any, cwd: str) -> List[Dict[str, Any]]:
     """Agents often read through the shell (`cat notes/x.md`) instead of the Read tool.
 
     Without this the radar looks broken on exactly the sessions that do the most work.
-    Only file-ish arguments are kept; flags and pipes are dropped.
+    Every `cat`/`head`/`sed` in the command counts, with every file it names; flags,
+    pipes and heredocs are dropped. Only paths that exist on disk are kept, so a word
+    inside a quoted script does not become a phantom read. A shell `grep`/`rg` takes
+    its hits from the command's own stdout.
     """
     if not command:
-        return None
+        return []
 
-    m = _SHELL_READ.search(command)
-    if m:
-        paths = []
-        for token in m.group(1).split():
+    events: List[Dict[str, Any]] = []
+    paths: List[str] = []
+    for m in _SHELL_READ.finditer(command):
+        segment = m.group(1)
+        try:
+            tokens = shlex.split(segment)
+        except ValueError:  # unbalanced quote: fall back to whitespace
+            tokens = segment.split()
+        if any(t.startswith("-i") or t == "--in-place" for t in tokens):
+            continue  # sed -i rewrites the file; nothing entered the context
+        for token in tokens:
             if token.startswith("-") or token in {"|", ";", "&&"}:
                 continue
-            token = token.strip("'\"")
-            if "." in os.path.basename(token):
-                paths.append(token)
-        if paths:
-            return {"kind": "read", "path": paths[0], "tool": "Bash", "via": "shell"}
+            if "." not in os.path.basename(token) and "/" not in token:
+                continue
+            full = _absolute(token, cwd)
+            if os.path.isfile(full) and full not in paths:
+                paths.append(full)
+
+    stdout = response.get("stdout") if isinstance(response, dict) else None
+    for full in paths:
+        ev: Dict[str, Any] = {"kind": "read", "path": full, "tool": "Bash", "via": "shell"}
+        if len(paths) == 1 and isinstance(stdout, str):
+            ev["chars"] = len(stdout)  # `head -40 x.md` returned 40 lines, not the file
+        events.append(ev)
 
     if _SHELL_SCAN.search(command):
-        return {"kind": "scan", "tool": "Bash", "pattern": command[:80], "hits": [], "via": "shell"}
+        events.append(
+            {
+                "kind": "scan",
+                "tool": "Bash",
+                "pattern": command[:80],
+                "hits": _scan_hits(response, cwd),
+                "via": "shell",
+            }
+        )
 
-    return None
+    return events
 
 
 def _note_tool(tool: str) -> None:
@@ -134,8 +183,17 @@ def _note_tool(tool: str) -> None:
         pass
 
 
-def _scan_hits(response: Any) -> List[str]:
-    """Best-effort extraction of file paths from a Grep/Glob response."""
+_WIN_DRIVE = re.compile(r"^[A-Za-z]:[\\/]")
+
+
+def _scan_hits(response: Any, cwd: str = "") -> List[str]:
+    """Best-effort extraction of file paths from a Grep/Glob response or a shell's stdout.
+
+    Structured responses (`filenames`) are taken as they are. Text is read line by
+    line: `path:12:match` (grep -n), `path:3` (grep -c) or a bare path (grep -l, glob,
+    find, rg's file headings). Every candidate is anchored to cwd and must exist as a
+    file, which is what keeps matched *content* from being mistaken for a path.
+    """
     text = ""
     if isinstance(response, str):
         text = response
@@ -143,27 +201,28 @@ def _scan_hits(response: Any) -> List[str]:
         for key in ("filenames", "files", "matches"):
             value = response.get(key)
             if isinstance(value, list):
-                return [str(v) for v in value if isinstance(v, (str, os.PathLike))][:400]
+                return [_absolute(str(v), cwd) for v in value if isinstance(v, (str, os.PathLike))][:400]
         for key in ("stdout", "output", "content", "result"):
             if isinstance(response.get(key), str):
                 text = response[key]
                 break
-    hits = []
+    seen, out = set(), []
     for line in text.splitlines():
         line = line.strip()
-        # "path:12:match" (grep -n) or a bare path (grep -l / glob)
-        candidate = line.split(":", 1)[0] if ":" in line else line
-        if candidate.startswith(("/", "./", "~")) or candidate.endswith(
-            (".md", ".py", ".ts", ".tsx", ".js", ".txt", ".json")
-        ):
-            hits.append(candidate)
-    # de-duplicate, keep order
-    seen, out = set(), []
-    for h in hits:
-        if h not in seen:
-            seen.add(h)
-            out.append(h)
-    return out[:400]
+        if not line:
+            continue
+        if _WIN_DRIVE.match(line):  # keep C:\ together with its path
+            candidate = line[:2] + line[2:].split(":", 1)[0]
+        else:
+            candidate = line.split(":", 1)[0]
+        full = _absolute(candidate.strip(), cwd)
+        if full in seen or not os.path.isfile(full):
+            continue
+        seen.add(full)
+        out.append(full)
+        if len(out) >= 400:
+            break
+    return out
 
 
 def cmd_hook(_args: argparse.Namespace) -> int:
@@ -174,17 +233,15 @@ def cmd_hook(_args: argparse.Namespace) -> int:
         return 0  # a malformed payload must never break the agent's turn
 
     try:
-        event = _extract(payload)
-        if event is None:
+        events = _extract(payload)
+        if not events:
             return 0
-        event.update(
-            ts=time.time(),
-            session=payload.get("session_id", ""),
-            cwd=payload.get("cwd", ""),
-        )
-        line = (json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8")
+        stamp = dict(ts=time.time(), session=payload.get("session_id", ""), cwd=payload.get("cwd", ""))
+        for event in events:
+            event.update(stamp)
+        line = "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in events).encode("utf-8")
         HOME.mkdir(parents=True, exist_ok=True)
-        # One O_APPEND write() per event. Several Claude Code sessions append to
+        # One O_APPEND write() per hook call. Several Claude Code sessions append to
         # this file at the same time, and a buffered text writer splits a long
         # line (a Grep with hundreds of hits) into chunks that interleave.
         flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0)
@@ -357,7 +414,7 @@ def _is_loopback(hostport: str) -> bool:
     return host in LOOPBACK_HOSTS or host.startswith("127.")
 
 
-def make_handler(vault: Path, exts: List[str]):
+def make_handler(vault: Path, exts: List[str], alias: Optional[Path] = None):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -404,6 +461,8 @@ def make_handler(vault: Path, exts: List[str]):
                 body = json.dumps(
                     {
                         "root": str(vault),
+                        "root_alias": str(alias or vault),  # as typed at --vault, symlinks intact
+                        "cpt": CHARS_PER_TOKEN,
                         "files": files,
                         "edges": scan_links(vault, files),
                         "total_tokens": sum(f["tokens"] for f in files),
@@ -525,6 +584,7 @@ def screen_size() -> tuple:
 
 def cmd_serve(args: argparse.Namespace) -> int:
     vault = Path(args.vault).expanduser().resolve()
+    alias = Path(os.path.abspath(os.path.expanduser(args.vault)))
     if not vault.is_dir():
         print(f"vault not found: {vault}", file=sys.stderr)
         return 1
@@ -533,7 +593,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
     HOME.mkdir(parents=True, exist_ok=True)
     EVENTS.touch(exist_ok=True)
 
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(vault, exts))
+    server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(vault, exts, alias))
     print(f"vault-radar · {len(files)} files · ~{sum(f['tokens'] for f in files):,} tokens")
     print(f"vault  : {vault}")
     print(f"events : {EVENTS}")
