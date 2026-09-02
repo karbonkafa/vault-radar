@@ -14,7 +14,8 @@ python3 radar.py serve --vault ~/notes    # then open http://localhost:7777
 
 ## Test it
 
-No test suite. Verify by hand before opening a PR:
+`python3 tests/test_hook.py` runs the hook against recorded Claude Code, Kai, Kimi and
+Codex payloads (stdlib only, temp vault). The rest is by hand before opening a PR:
 
 - `echo 'not json' | python3 radar.py hook` — must exit 0, print nothing. The hook
   may never block or throw; a bad payload is swallowed silently.

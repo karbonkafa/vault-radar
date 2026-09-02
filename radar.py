@@ -52,14 +52,36 @@ SCAN_TOOLS = {"Grep", "Glob"}
 
 
 def _extract(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Turn a raw hook payload into radar events: usually one, none if uninteresting."""
-    event = payload.get("hook_event_name", "")
-    tool = payload.get("tool_name", "")
+    """Turn Claude, Codex, Kimi, or Kai hook payloads into radar events."""
+    raw_event = payload.get("hook_event_name", "")
+    event = {
+        "post_tool_call": "PostToolUse",
+        "pre_llm_call": "UserPromptSubmit",
+        "on_session_end": "Stop",
+    }.get(raw_event, raw_event)
+    tool = payload.get("tool_name") or ""
     tin = payload.get("tool_input") or {}
     cwd = payload.get("cwd") or ""
+    extra = payload.get("extra") if isinstance(payload.get("extra"), dict) else {}
+
+    response = payload.get("tool_response")
+    if response is None:
+        response = payload.get("tool_output")
+    if response is None:
+        response = extra.get("result")
+    if isinstance(response, str):
+        try:
+            response = json.loads(response)
+        except (TypeError, ValueError):
+            pass
 
     if event == "UserPromptSubmit":
-        return [{"kind": "prompt", "text": (payload.get("prompt") or "")[:400]}]
+        prompt = payload.get("prompt") or extra.get("user_message") or ""
+        if isinstance(prompt, list):  # Kimi sends the prompt as content blocks
+            prompt = " ".join(
+                b.get("text", "") if isinstance(b, dict) else str(b) for b in prompt
+            )
+        return [{"kind": "prompt", "text": str(prompt)[:400]}]
 
     if event == "Stop":
         return [{"kind": "stop"}]
@@ -67,26 +89,27 @@ def _extract(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     if event != "PostToolUse":
         return []
 
-    if tool in READ_TOOLS or tool.lower() in {"readfile", "view", "opendocument"}:
-        path = tin.get("file_path") or tin.get("notebook_path")
+    tool_key = tool.lower()
+    if tool in READ_TOOLS or tool_key in {"readfile", "read_file", "view", "opendocument"}:
+        path = tin.get("file_path") or tin.get("notebook_path") or tin.get("path")
         if not path:
             return []
         ev = {"kind": "read", "path": _absolute(path, cwd), "tool": tool}
-        chars = _returned_chars(payload.get("tool_response"))
+        chars = _returned_chars(response)
         if chars is not None:
             ev["chars"] = chars  # what actually entered the context: an offset/limit Read is partial
         return [ev]
 
-    if tool == "Bash":
-        return _from_shell(tin.get("command") or "", payload.get("tool_response"), cwd)
+    if tool_key in {"bash", "terminal", "shell", "exec_command"}:
+        return _from_shell(tin.get("command") or tin.get("cmd") or "", response, cwd)
 
-    if tool in SCAN_TOOLS or tool.lower() in {"search", "codesearch"}:
+    if tool in SCAN_TOOLS or tool_key in {"search", "codesearch", "search_files"}:
         return [
             {
                 "kind": "scan",
                 "tool": tool,
                 "pattern": tin.get("pattern") or tin.get("glob") or "",
-                "hits": _scan_hits(payload.get("tool_response"), cwd),
+                "hits": _scan_hits(response, cwd),
             }
         ]
 
@@ -103,11 +126,20 @@ def _absolute(path: str, cwd: str) -> str:
 
 
 def _returned_chars(response: Any) -> Optional[int]:
-    """Size of the content the Read tool handed back, if the response carries it."""
+    """Size of the content the read tool handed back, if the response carries it.
+
+    Claude Code wraps it as ``{"file": {"content": ...}}``, Kai's ``read_file`` as
+    ``{"content": ...}``; Kimi hands back the text itself.
+    """
     if isinstance(response, dict):
         inner = response.get("file")
         if isinstance(inner, dict) and isinstance(inner.get("content"), str):
             return len(inner["content"])
+        if isinstance(response.get("content"), str):
+            return len(response["content"])
+        return None
+    if isinstance(response, str):
+        return len(response)
     return None
 
 
@@ -146,7 +178,12 @@ def _from_shell(command: str, response: Any, cwd: str) -> List[Dict[str, Any]]:
             if os.path.isfile(full) and full not in paths:
                 paths.append(full)
 
-    stdout = response.get("stdout") if isinstance(response, dict) else None
+    stdout = None
+    if isinstance(response, dict):  # Claude Code: stdout; Kai's terminal: output
+        for key in ("stdout", "output"):
+            if isinstance(response.get(key), str):
+                stdout = response[key]
+                break
     for full in paths:
         ev: Dict[str, Any] = {"kind": "read", "path": full, "tool": "Bash", "via": "shell"}
         if len(paths) == 1 and isinstance(stdout, str):
@@ -205,8 +242,8 @@ def _scan_hits(response: Any, cwd: str = "") -> List[str]:
             value = response.get(key)
             if isinstance(value, list):
                 return [_absolute(str(v), cwd) for v in value if isinstance(v, (str, os.PathLike))][:400]
-        for key in ("stdout", "output", "content", "result"):
-            if isinstance(response.get(key), str):
+        for key in ("stdout", "output", "content", "result", "matches_text"):
+            if isinstance(response.get(key), str):  # matches_text: Kai's search_files
                 text = response[key]
                 break
     seen, out = set(), []
