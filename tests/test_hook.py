@@ -122,6 +122,15 @@ def main():
          [rd("notes/a.md", 10, shell=True), sc("head -3 notes/a.md | grep foo", [], shell=True)]),
         ("git log --grep (scan, no hits)", sh("git log --grep=fix", "abc fix thing\n"),
          [sc("git log --grep=fix", [], shell=True)]),
+        # -- a grep that names one file prints no filename: the hit is the argument ----
+        ("grep single file, relative (hit)", sh("grep -n foo notes/a.md", "1:foo line1\n4:foo again\n"),
+         [sc("grep -n foo notes/a.md", ["notes/a.md"], shell=True)]),
+        ("grep single file, absolute (hit)", sh("grep -n foo " + p("notes/a.md"), "1:foo line1\n"),
+         [sc("grep -n foo " + p("notes/a.md"), ["notes/a.md"], shell=True)]),
+        ("rg single file (hit)", sh("rg foo notes/b.md", "3:foo\n"),
+         [sc("rg foo notes/b.md", ["notes/b.md"], shell=True)]),
+        ("grep single file, no match (no hit)", sh("grep -n zzz notes/b.md", ""),
+         [sc("grep -n zzz notes/b.md", [], shell=True)]),
         ("wc -l (nothing)", sh("wc -l notes/a.md", "6 notes/a.md\n"), []),
         # -- Claude Code: structured tools ------------------------------------------
         ("Read tool w/ content", claude("Read", {"file_path": p("notes/a.md"), "offset": 1, "limit": 2},

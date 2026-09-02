@@ -145,6 +145,32 @@ def _returned_chars(response: Any) -> Optional[int]:
 
 _SHELL_READ = re.compile(r"\b(?:cat|bat|head|tail|less|more|sed)\b\s+([^|;&<>\n]+)")
 _SHELL_SCAN = re.compile(r"\b(?:rg|grep|ag|ack|fd|find)\b")
+_SHELL_SEARCH = re.compile(r"\b(?:rg|grep|ag|ack)\b\s+([^|;&<>\n]+)")
+
+
+def _named_search_files(command: str, cwd: str) -> List[str]:
+    """Existing files named as arguments of the command's grep/rg/ag/ack segments.
+
+    Same token rules as the shell reader: flags dropped, a bare word without a dot
+    or a slash ignored, only paths that exist on disk kept — so the pattern itself
+    is not mistaken for a file.
+    """
+    named: List[str] = []
+    for m in _SHELL_SEARCH.finditer(command):
+        segment = m.group(1)
+        try:
+            tokens = shlex.split(segment)
+        except ValueError:  # unbalanced quote: fall back to whitespace
+            tokens = segment.split()
+        for token in tokens:
+            if token.startswith("-"):
+                continue
+            if "." not in os.path.basename(token) and "/" not in token:
+                continue
+            full = _absolute(token, cwd)
+            if os.path.isfile(full) and full not in named:
+                named.append(full)
+    return named
 
 
 def _from_shell(command: str, response: Any, cwd: str) -> List[Dict[str, Any]]:
@@ -191,12 +217,21 @@ def _from_shell(command: str, response: Any, cwd: str) -> List[Dict[str, Any]]:
         events.append(ev)
 
     if _SHELL_SCAN.search(command):
+        hits = _scan_hits(response, cwd)
+        # `grep foo x.md` prints its matches without the filename, so stdout carries
+        # no path and the file never turned yellow. When the command's grep/rg names
+        # exactly one file and returned anything at all, that file is the hit.
+        text = stdout if isinstance(stdout, str) else response if isinstance(response, str) else ""
+        if text.strip():
+            named = _named_search_files(command, cwd)
+            if len(named) == 1 and named[0] not in hits:
+                hits.append(named[0])
         events.append(
             {
                 "kind": "scan",
                 "tool": "Bash",
                 "pattern": command[:80],
-                "hits": _scan_hits(response, cwd),
+                "hits": hits,
                 "via": "shell",
             }
         )
