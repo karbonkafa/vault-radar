@@ -66,6 +66,45 @@ def main():
     check("classify: Obsidian, mdworker, git dropped",
           set(by) == {"cursor", "vscode", "antigravity"}, json.dumps(found))
 
+    # -- workspace evidence (IDEs keep no vault file open; they record the folder) ---------
+    app = os.path.join(tmp, "app-support")
+    def ws(ide, key, folder):
+        d = os.path.join(app, ide, "User", "workspaceStorage", key); os.makedirs(d)
+        with open(os.path.join(d, "workspace.json"), "w", encoding="utf-8") as fh:
+            json.dump({"folder": folder}, fh)
+    ws("Cursor", "a1", "file:///Users/k/karbon-vault")
+    ws("Antigravity IDE", "b2", "file:///Users/k/karbon-vault")
+    ws("Code", "c3", "file:///Users/k/other-repo")
+    ws("Windsurf", "d4", "file:///Users/k/karbon%20vault")
+    proc = run(["agents", "classify", "--vault", "/Users/k/karbon-vault", "--app-support", app], "", env)
+    try:
+        wfound = json.loads(proc.stdout)
+    except ValueError:
+        wfound = None
+    wby = {f.get("agent"): f for f in (wfound or [])}
+    check("workspace: exits 0, Cursor and Antigravity found from workspace.json with no lsof hits",
+          proc.returncode == 0 and set(wby) == {"cursor", "antigravity"}
+          and all("workspace" in f.get("evidence", []) for f in (wfound or [])),
+          "rc=%s out=%r err=%r" % (proc.returncode, proc.stdout[:300], proc.stderr[-300:]))
+    check("workspace: entry carries the workspace.json path, no pid",
+          wby.get("cursor", {}).get("pid") is None and "workspaceStorage" in str(wby.get("cursor", {}).get("workspace", "")), json.dumps(wfound))
+    proc = run(["agents", "classify", "--vault", "/Users/k/karbon vault", "--app-support", app], "", env)
+    try:
+        sfound = {f.get("agent") for f in json.loads(proc.stdout)}
+    except ValueError:
+        sfound = None
+    check("workspace: percent-encoded folder matches a vault path with a space", sfound == {"windsurf"}, "rc=%s out=%r" % (proc.returncode, proc.stdout[:300]))
+    proc = run(["agents", "classify", "--vault", "/Users/k/karbon-vault", "--app-support", app], LSOF, env)
+    try:
+        mfound = json.loads(proc.stdout)
+    except ValueError:
+        mfound = []
+    mby = {f.get("agent"): f for f in mfound}
+    check("workspace: lsof and workspace evidence merge into one entry per agent",
+          [f["agent"] for f in mfound].count("cursor") == 1 and mby.get("cursor", {}).get("pid") == 123
+          and set(mby.get("cursor", {}).get("evidence", [])) == {"lsof", "workspace"} and set(mby) == {"cursor", "vscode", "antigravity"},
+          json.dumps(mfound))
+
     # -- offer --------------------------------------------------------------------------
     os.makedirs(home)
     with open(os.path.join(home, "hooked.json"), "w", encoding="utf-8") as fh:

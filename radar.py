@@ -20,6 +20,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import urllib.parse
 import sys
 import threading
 import time
@@ -1068,6 +1069,56 @@ def _lsof_vault(vault: str) -> List[Dict[str, Any]]:
     return _parse_lsof(proc.stdout, vault)  # lsof exits 1 when nothing is open; that is not an error
 
 
+# IDEs hold no vault file open between reads; they record the folder they have open under
+# ~/Library/Application Support/<app>/User/workspaceStorage/<hash>/workspace.json instead.
+WORKSPACE_STORES = [("cursor", "Cursor"), ("antigravity", "Antigravity IDE"),
+                    ("vscode", "Code"), ("windsurf", "Windsurf")]
+
+
+def _default_app_support() -> str:
+    return os.environ.get("VAULT_RADAR_APP_SUPPORT") or str(Path.home() / "Library" / "Application Support")
+
+
+def _folder_of_uri(uri: Any) -> Optional[str]:
+    if not isinstance(uri, str):
+        return None
+    if uri.startswith("file://"):
+        uri = urllib.parse.unquote(urllib.parse.urlsplit(uri).path)
+    return os.path.normpath(uri) if uri.startswith("/") else None
+
+
+def _workspace_hits(vault: str, app_support: Optional[str] = None) -> List[Dict[str, Any]]:
+    """IDE workspace records that point at the vault (or inside it) -> one entry per agent."""
+    vault = os.path.normpath(os.path.expanduser(vault))
+    root = Path(os.path.expanduser(app_support or _default_app_support()))
+    found: Dict[str, Dict[str, Any]] = {}
+    for agent, dirname in WORKSPACE_STORES:
+        for ws in sorted((root / dirname / "User" / "workspaceStorage").glob("*/workspace.json")):
+            data = _load_json(ws, None)
+            folder = _folder_of_uri(data.get("folder")) if isinstance(data, dict) else None
+            if not folder or not (folder == vault or folder.startswith(vault + os.sep)):
+                continue
+            found.setdefault(agent, {"agent": agent, "evidence": ["workspace"], "workspace": str(ws), "folder": folder})
+    return list(found.values())
+
+
+def _vault_users(vault: str, lsof_text: Optional[str] = None, app_support: Optional[str] = None) -> List[Dict[str, Any]]:
+    """lsof evidence (files held open now) merged with workspace evidence, one entry per agent."""
+    merged: Dict[str, Dict[str, Any]] = {}
+    lsof_entries = _parse_lsof(lsof_text, vault) if lsof_text is not None else _lsof_vault(vault)
+    for entry in lsof_entries:
+        entry.setdefault("evidence", ["lsof"])
+        merged[entry["agent"]] = entry
+    for entry in _workspace_hits(vault, app_support):
+        cur = merged.get(entry["agent"])
+        if cur is None:
+            merged[entry["agent"]] = entry
+        else:
+            cur["evidence"] = sorted(set(cur.get("evidence", [])) | {"workspace"})
+            cur["workspace"], cur["folder"] = entry["workspace"], entry["folder"]
+    return list(merged.values())
+
+
 def _load_json(path: Path, default: Any) -> Any:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -1112,17 +1163,22 @@ def _offer(found: List[Dict[str, Any]], checks_dir: Path, notify: bool) -> int:
             continue
         files = [str(f) for f in (entry.get("files") or [])]
         stamp = time.strftime("%Y-%m-%d %H:%M")
+        if files:
+            seen = "%s (pid %s) vault'ta %d dosya açık tuttu: %s" % (entry.get("command", ""), entry.get("pid"), len(files), ", ".join(files[:3]))
+        else:
+            seen = "çalışma alanı olarak %s kayıtlı (%s)" % (entry.get("folder", "?"), entry.get("workspace", "workspace.json"))
         recipe = ("`%s hook-install %s`" % (SELF, agent)) if agent in RECIPES else "tarif yok, elle bağlanır"
         program["items"].append({
             "id": "offer-" + agent,
             "title": "%s vault'u kullanıyor — hook'lansın mı?" % agent,
-            "criterion": "%s: %s (pid %s) vault'ta %d dosya açık tuttu: %s. Onay verilirse %s koşar ve olay üretimi "
+            "criterion": "%s: %s. Onay verilirse %s koşar ve olay üretimi "
                          "sondayla doğrulanır; reddedilirse bu madde silinir, ~/.vault-radar/offers.json kaydı kalır ve bir daha sorulmaz."
-                         % (stamp, entry.get("command", ""), entry.get("pid"), len(files), ", ".join(files[:3]), recipe),
+                         % (stamp, seen, recipe),
             "state": "draft", "at": time.strftime("%Y-%m-%d"), "by": "radar.py agents offer",
             "priority": len(program["items"]) + 1,
         })
-        offered[agent] = {"at": stamp, "pid": entry.get("pid"), "command": entry.get("command"), "files": files[:10]}
+        offered[agent] = {"at": stamp, "pid": entry.get("pid"), "command": entry.get("command"), "files": files[:10],
+                          "evidence": entry.get("evidence"), "folder": entry.get("folder")}
         new.append(agent)
     if new:
         _dump_json(program_path, program)
@@ -1173,7 +1229,7 @@ def cmd_agents(args: argparse.Namespace) -> int:
         if not args.vault:
             print("--vault is required", file=sys.stderr)
             return 2
-        print(json.dumps(_parse_lsof(sys.stdin.read(), args.vault), ensure_ascii=False))
+        print(json.dumps(_vault_users(args.vault, sys.stdin.read(), args.app_support), ensure_ascii=False))
         return 0
     if args.what == "offer":
         try:
@@ -1185,7 +1241,7 @@ def cmd_agents(args: argparse.Namespace) -> int:
         if not args.vault:
             print("--vault is required", file=sys.stderr)
             return 2
-        return _offer(_lsof_vault(args.vault), checks_dir, notify=not args.no_notify)
+        return _offer(_vault_users(args.vault, None, args.app_support), checks_dir, notify=not args.no_notify)
     if args.what == "install-watch":
         if not args.vault:
             print("--vault is required", file=sys.stderr)
@@ -1284,6 +1340,7 @@ def main() -> int:
     agents.add_argument("--checks-dir", default=str(Path(os.environ.get("KAI_HOME") or "~/.kai").expanduser() / "checks"),
                         help="where the kaiChecks programme files live")
     agents.add_argument("--no-notify", action="store_true", help="no macOS notification on a new offer")
+    agents.add_argument("--app-support", help="IDE workspace records root (default ~/Library/Application Support)")
     agents.set_defaults(fn=cmd_agents)
 
     install = sub.add_parser("hook-install", help="write an agent's radar hook config, idempotently")
