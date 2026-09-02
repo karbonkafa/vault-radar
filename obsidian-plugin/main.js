@@ -42,6 +42,7 @@ module.exports = class VaultRadarPlugin extends Plugin {
     catch (_) { this.verifyFlag = false; }
     this.activePath = null;
     this.session = null;
+    this.pin = null;             // session the radar is pinned to (the `follow` file), or null
     this.readTokens = 0;
     this.readTk = new Map();     // relative path -> tokens counted for it this turn
     this.agentTk = new Map();    // the same, for reads made by subagents
@@ -133,6 +134,7 @@ module.exports = class VaultRadarPlugin extends Plugin {
     const complete = chunk.slice(0, lastNewline + 1);
     this.offset += Buffer.byteLength(complete, 'utf8');
 
+    this.pin = this.readPin();
     for (const line of complete.split('\n')) {
       if (!line.trim()) continue;
       try { this.handle(JSON.parse(line)); } catch (_) { /* skip malformed */ }
@@ -142,7 +144,9 @@ module.exports = class VaultRadarPlugin extends Plugin {
   }
 
   handle(ev) {
-    // Several Claude Code sessions share one log; follow whichever prompted last.
+    // Several Claude Code sessions share one log; follow whichever prompted last,
+    // unless a pin (the `follow` file next to the log) names the session to keep.
+    if (this.pin && ev.session && !String(ev.session).startsWith(this.pin)) return;
     if (ev.kind === 'prompt') this.session = ev.session || null;
     else if (this.session && ev.session && ev.session !== this.session) return;
 
@@ -153,7 +157,7 @@ module.exports = class VaultRadarPlugin extends Plugin {
       this.readTk.clear();
       this.agentTokens = 0;
       this.agentTk.clear();
-      this.status.setText('radar: ' + String(ev.text || '').slice(0, 34));
+      this.status.setText('radar: ' + (this.pin ? 'pinned · ' : '') + String(ev.text || '').slice(0, 34));
       return;
     }
     if (ev.kind === 'scan' && this.settings.showScan) {
@@ -193,6 +197,14 @@ module.exports = class VaultRadarPlugin extends Plugin {
     if (ev.kind === 'stop') {
       this.activePath = null;
     }
+  }
+
+  /** The session the radar is pinned to — the `follow` file next to the log — or null. */
+  readPin() {
+    try {
+      const pin = fs.readFileSync(path.join(path.dirname(this.settings.eventsPath), 'follow'), 'utf8').trim();
+      return pin || null;
+    } catch (_) { return null; }
   }
 
   estimateTokens(rel) {

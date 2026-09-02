@@ -163,6 +163,22 @@ Token sayıları gerçek tokenizer çıktısı değil, **tahmin**: tool'un gerç
 bayt sayısı payload'da varsa ondan (kısmi `Read`, `head -40`), yoksa dosya boyutundan.
 Oran fikri versinler diye varlar, faturalandırma için değil.
 
+### Aynı anda birkaç oturum
+
+Makinedeki her oturum aynı log'a ekler. Varsayılan olarak görüntüleyici de Obsidian
+eklentisi de en son prompt gönderen oturumu izler ve her yeni prompt'ta temizlenir;
+birkaç oturum çalışan bir makinede ekran hiç durmaz. Sabitle:
+
+```bash
+radar.py follow --last          # en son prompt gönderen oturum
+radar.py follow a1b2c3d4        # bir oturum kimliği ya da benzersiz bir ön eki
+radar.py follow --off           # yeniden son prompt'u izle
+```
+
+Sabitleme `~/.vault-radar/follow` dosyasıdır; eklenti de aynı dosyayı okur, tek komut
+ikisini de sabitler. Sabitliyken diğer oturumların prompt'ları ekranı ne değiştirir ne
+temizler; durum çubuğunda `pinned` yazar.
+
 ## Demo modu
 
 Görüntüleyiciyi `?demo=1` ile aç ya da **DEMO**'ya tıkla; kayıtlı bir iz sahte bir
@@ -178,8 +194,9 @@ arayüzü denemek için kullanışlı.
 - `Grep` eşleşmelerinin çıkarılması elden geldiğince yapılıyor: tool cevabı
   ayrıştırılıyor ve o cevabın tam biçimi hiçbir public sözleşmenin parçası değil,
   değişebilir.
-- Aynı anda tek oturum. İki eşzamanlı Claude Code oturumu aynı log'a yazar ve
-  kayıtlar iç içe geçer.
+- Birden çok Claude Code oturumu aynı log'a yazar. Varsayılan olarak ekran en son
+  prompt gönderen oturumu izler, yani meşgul bir komşu her prompt'ta ekranı alır;
+  `radar.py follow` tek oturuma sabitler (bkz. Seçenekler).
 - Sadece yerel, `127.0.0.1` üzerinde dinliyor.
 
 ## Lisans

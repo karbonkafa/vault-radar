@@ -157,6 +157,23 @@ Token counts are **estimates**: from the bytes the tool actually returned when t
 payload carries them (a partial `Read`, a `head -40`), otherwise from file size. Not
 real tokenizer output; there for proportion, not for billing.
 
+### Several sessions at once
+
+Every session on the machine appends to the same log. By default the viewer and the
+Obsidian plugin follow whichever session prompted last and clear on each new prompt,
+which on a machine running several sessions means the display never holds still.
+Pin it:
+
+```bash
+radar.py follow --last          # the session that prompted last
+radar.py follow a1b2c3d4        # a session id, or a unique prefix of one
+radar.py follow --off           # back to following the last prompt
+```
+
+The pin is the file `~/.vault-radar/follow`; the plugin reads the same file, so one
+command pins both. While pinned, other sessions' prompts neither switch nor clear the
+display, and the status bar says `pinned`.
+
 ## Demo mode
 
 Open the viewer with `?demo=1`, or click **DEMO**, to replay a recorded trace
@@ -171,8 +188,9 @@ wiring hooks up.
   matching, and never on the bare filename alone.
 - `Grep` hit extraction is best-effort: it parses the tool response, whose exact
   shape is not part of any public contract and may change.
-- Single session at a time. Two concurrent Claude Code sessions write to the same
-  log and will interleave.
+- Several Claude Code sessions write to the same log. By default the display follows
+  whichever session prompted last, so a busy neighbour takes it over on every prompt;
+  `radar.py follow` pins it to one session (see Options).
 - Local only, binds to `127.0.0.1`.
 
 ## Licence

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """vault-radar — watch, in real time, which files your coding agent actually reads.
 
-Three subcommands:
+Four subcommands:
     radar.py hook              read a Claude Code hook event on stdin, append it to the log
     radar.py serve [options]   serve the live viewer at http://localhost:7777
     radar.py install           print the settings.json snippet that wires the hook up
+    radar.py follow [SESSION]  pin the viewer and the Obsidian plugin to one session
 
 No third-party dependencies. Python 3.9+.
 """
@@ -27,6 +28,7 @@ from urllib.parse import unquote
 HOME = Path(os.environ.get("VAULT_RADAR_HOME") or (Path.home() / ".vault-radar")).expanduser()
 EVENTS = HOME / "events.jsonl"
 UI_DIR = Path(__file__).resolve().parent / "ui"
+FOLLOW = HOME / "follow"
 
 
 def _ratio(raw: str) -> float:
@@ -382,6 +384,29 @@ def tail(path: Path, start_at_end: bool) -> Iterator[str]:
         time.sleep(0.35)
 
 
+def pinned_session() -> Optional[str]:
+    """The session the radar is pinned to, or None to follow whichever prompted last.
+
+    The pin is the contents of ``~/.vault-radar/follow``: a session id, or a unique
+    prefix of one. The Obsidian plugin reads the same file, so one ``radar.py follow``
+    pins both. Without it, every prompt from any session takes the display over,
+    which on a machine running several sessions means it never holds still.
+    """
+    try:
+        pin = FOLLOW.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return pin or None
+
+
+def _same_session(row: Dict[str, Any], session: Optional[str]) -> bool:
+    """True if the event belongs to the session, or names no session at all."""
+    sid = row.get("session")
+    if not sid or not session:
+        return True
+    return str(sid).startswith(session)
+
+
 def current_turn(limit: int = 4000) -> List[str]:
     """Return the events of the turn in progress: everything after the last prompt.
 
@@ -399,15 +424,17 @@ def current_turn(limit: int = 4000) -> List[str]:
         return []
     # Several Claude Code sessions share one log. Anchor on the most recent
     # prompt and keep only that session's events, otherwise a second terminal
-    # silently steals the viewer.
-    start, session = 0, None
+    # silently steals the viewer. A pin (see pinned_session) names the session
+    # to anchor on instead, so a busy neighbour cannot steal it at all.
+    pin = pinned_session()
+    start, session = 0, pin
     for i in range(len(lines) - 1, -1, -1):
         try:
             row = json.loads(lines[i])
         except ValueError:
             continue
-        if row.get("kind") == "prompt":
-            start, session = i, row.get("session")
+        if row.get("kind") == "prompt" and _same_session(row, pin):
+            start, session = i, (row.get("session") or pin)
             break
 
     out = []
@@ -415,7 +442,7 @@ def current_turn(limit: int = 4000) -> List[str]:
         if not ln.strip():
             continue
         try:
-            if session and json.loads(ln).get("session") not in (session, None, ""):
+            if session and not _same_session(json.loads(ln), session):
                 continue
         except ValueError:
             continue
@@ -486,6 +513,7 @@ def make_handler(vault: Path, exts: List[str], alias: Optional[Path] = None):
                         "root": str(vault),
                         "root_alias": str(alias or vault),  # as typed at --vault, symlinks intact
                         "cpt": CHARS_PER_TOKEN,
+                        "follow": pinned_session(),
                         "files": files,
                         "edges": scan_links(vault, files),
                         "total_tokens": sum(f["tokens"] for f in files),
@@ -534,6 +562,13 @@ def make_handler(vault: Path, exts: List[str], alias: Optional[Path] = None):
             last_beat = time.time()
             try:
                 for line in tail(EVENTS, start_at_end=True):
+                    pin = pinned_session()  # re-read: the pin can change mid-stream
+                    if pin:
+                        try:
+                            if not _same_session(json.loads(line), pin):
+                                continue
+                        except ValueError:
+                            pass
                     self.wfile.write(b"data: " + line.strip().encode() + b"\n\n")
                     self.wfile.flush()
                     now = time.time()
@@ -675,6 +710,42 @@ def cmd_install(_args: argparse.Namespace) -> int:
 # ──────────────────────────────────────────── cli
 
 
+def cmd_follow(args: argparse.Namespace) -> int:
+    """Pin the viewer and the Obsidian plugin to one session, or release the pin."""
+    if args.off:
+        try:
+            FOLLOW.unlink()
+        except FileNotFoundError:
+            pass
+        print("following the last prompt")
+        return 0
+    session = (args.session or "").strip()
+    if args.last:
+        try:
+            lines = EVENTS.read_text(encoding="utf-8").split("\n")
+        except OSError:
+            lines = []
+        for ln in reversed(lines):
+            try:
+                row = json.loads(ln)
+            except ValueError:
+                continue
+            if row.get("kind") == "prompt" and row.get("session"):
+                session = str(row["session"])
+                break
+        if not session:
+            print("no prompt in the log yet", file=sys.stderr)
+            return 1
+    if session:
+        HOME.mkdir(parents=True, exist_ok=True)
+        FOLLOW.write_text(session + "\n", encoding="utf-8")
+        print(f"pinned to session {session}")
+        return 0
+    pin = pinned_session()
+    print(f"pinned to session {pin}" if pin else "following the last prompt")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="radar", description=__doc__)
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -690,6 +761,12 @@ def main() -> int:
     serve.set_defaults(fn=cmd_serve)
 
     sub.add_parser("install", help="print the settings.json snippet").set_defaults(fn=cmd_install)
+
+    follow = sub.add_parser("follow", help="pin the viewer and the Obsidian plugin to one session")
+    follow.add_argument("session", nargs="?", help="session id, or a unique prefix of one")
+    follow.add_argument("--last", action="store_true", help="pin to the session that prompted last")
+    follow.add_argument("--off", action="store_true", help="follow the last prompt again (default)")
+    follow.set_defaults(fn=cmd_follow)
 
     args = parser.parse_args()
     return args.fn(args)
