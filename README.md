@@ -72,10 +72,17 @@ Radar observes; it is not allowed to break your turn.
 | dim | never touched this turn |
 | yellow | a `grep`/`glob` matched it — the agent saw the **name**, not the content |
 | orange | actually opened and read into context |
+| blue | read by a **subagent** only — it never entered the main context; a main-thread read of the same file turns it orange |
 
 The yellow state is the interesting one. A search that returns forty filenames
 costs almost nothing; opening forty files costs everything. Radar shows the
 difference.
+
+The blue state is the other half of that argument. A subagent's tool calls fire the
+same hook, and Claude Code stamps those payloads with `agent_id` and `agent_type`;
+the hook keeps both, and both viewers count those reads apart. `READ TK` and the
+ratio are main-thread only — a file an Explore agent read cost that agent's context,
+not yours, which is the point of delegating.
 
 ## Inside Obsidian's own graph
 
@@ -99,6 +106,7 @@ the hook alone is enough.
 | pale peach, enlarged | being read right now |
 | orange | read this turn |
 | amber | a search matched the name, never opened |
+| blue | read by a subagent only |
 | default | untouched |
 
 ### The robot
@@ -112,7 +120,8 @@ means that page is not reachable from where the agent just was.
 
 Toggle it, resize it, or change its speed in the plugin settings.
 
-A status-bar item counts files and estimated tokens for the current turn.
+A status-bar item counts files and estimated tokens for the current turn, with
+delegated reads counted separately.
 Commands: **Clear radar highlighting**, **Reconnect to event log**.
 
 **Turn off Restricted mode.** If the toggle is awkward to find, the flag lives at

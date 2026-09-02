@@ -238,6 +238,11 @@ def cmd_hook(_args: argparse.Namespace) -> int:
         if not events:
             return 0
         stamp = dict(ts=time.time(), session=payload.get("session_id", ""), cwd=payload.get("cwd", ""))
+        # A subagent's tool calls fire the same hooks and carry these two fields. The
+        # viewers draw those reads apart: they never entered the main context.
+        for key in ("agent_id", "agent_type"):
+            if payload.get(key):
+                stamp[key] = str(payload[key])
         for event in events:
             event.update(stamp)
         line = "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in events).encode("utf-8")

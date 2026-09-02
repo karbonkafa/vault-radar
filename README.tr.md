@@ -77,9 +77,16 @@ Radar sadece izler; senin turunu bozmaya yetkisi yok.
 | sönük | bu turda hiç dokunulmadı |
 | sarı | bir `grep`/`glob` eşleşti — ajan **adını** gördü, içeriğini değil |
 | turuncu | gerçekten açıldı ve context'e okundu |
+| mavi | yalnız bir **alt ajan** okudu — ana context'e hiç girmedi; aynı dosyayı ana akış okursa turuncuya döner |
 
 İlginç olan sarı durum. Kırk dosya adı döndüren bir arama neredeyse bedava; kırk
 dosyayı açmak ise her şeye mal oluyor. Radar bu farkı gösteriyor.
+
+Mavi durum aynı argümanın öbür yarısı. Bir alt ajanın tool çağrıları aynı hook'u
+tetikliyor ve Claude Code o payload'lara `agent_id` ile `agent_type` damgasını vuruyor;
+hook ikisini de saklıyor, iki görüntüleyici de o okumaları ayrı sayıyor. `OKUNAN TK`
+ve oran yalnız ana akışa ait — bir Explore ajanının okuduğu dosya o ajanın context'ine
+mal oldu, seninkine değil; devretmenin amacı da bu.
 
 ## Obsidian'ın kendi graph'ı içinde
 
@@ -103,6 +110,7 @@ olması gerekmiyor**; hook tek başına yeterli.
 | soluk şeftali, büyütülmüş | şu anda okunuyor |
 | turuncu | bu turda okundu |
 | kehribar | bir arama adıyla eşleşti, hiç açılmadı |
+| mavi | yalnız bir alt ajan okudu |
 | varsayılan | dokunulmadı |
 
 ### Robot
@@ -118,6 +126,7 @@ demek.
 Eklenti ayarlarından robotu kapatabilir, boyutunu ya da hızını değiştirebilirsin.
 
 Durum çubuğundaki bir öğe, mevcut turun dosya sayısını ve tahmini token'ını
+(devredilen okumalar ayrı sayılarak)
 sayıyor. Komutlar: **Clear radar highlighting**, **Reconnect to event log**.
 
 **Restricted mode'u kapat.** Bu ayarı bulmak zor geliyorsa, bayrak

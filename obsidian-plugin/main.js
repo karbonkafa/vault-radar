@@ -18,6 +18,7 @@ const os = require('os');
 const COLOR = {
   read: 0xff7a45,   // opened and read into context
   scan: 0xe3b341,   // a grep/glob matched the name only
+  delegated: 0x6cb6ff, // read by a subagent only — never entered the main context
   active: 0xffe0cc, // currently being read
 };
 
@@ -43,6 +44,8 @@ module.exports = class VaultRadarPlugin extends Plugin {
     this.session = null;
     this.readTokens = 0;
     this.readTk = new Map();     // relative path -> tokens counted for it this turn
+    this.agentTk = new Map();    // the same, for reads made by subagents
+    this.agentTokens = 0;
     this.offset = 0;
 
     this.status = this.addStatusBarItem();
@@ -148,31 +151,43 @@ module.exports = class VaultRadarPlugin extends Plugin {
       if (this.settings.fadeOnPrompt) this.clearMarks(false);
       this.readTokens = 0;
       this.readTk.clear();
+      this.agentTokens = 0;
+      this.agentTk.clear();
       this.status.setText('radar: ' + String(ev.text || '').slice(0, 34));
       return;
     }
     if (ev.kind === 'scan' && this.settings.showScan) {
       for (const hit of ev.hits || []) {
         const rel = this.toRelative(hit);
-        if (rel && this.marks.get(rel) !== 'read') this.marks.set(rel, 'scan');
+        const cur = rel && this.marks.get(rel);
+        if (rel && cur !== 'read' && cur !== 'delegated') this.marks.set(rel, 'scan');
       }
       return;
     }
     if (ev.kind === 'read') {
       const rel = this.toRelative(ev.path);
       if (!rel) return;
-      this.marks.set(rel, 'read');
+      // A read by a subagent (the event carries agent_id) never entered the main
+      // context: its own colour, its own count, and a later main-thread read of the
+      // same file turns it orange.
+      const delegated = !!ev.agent_id;
+      if (!delegated || this.marks.get(rel) !== 'read') this.marks.set(rel, delegated ? 'delegated' : 'read');
       this.activePath = rel;
       this.walkTo(rel);
       // Count what the tool returned when the hook saw it — a partial Read is partial
       // context. Partial reads add up, capped at the whole file.
       const full = this.estimateTokens(rel);
       const got = (ev.chars != null && isFinite(ev.chars)) ? Math.round(ev.chars / 3.8) : full;
-      this.readTk.set(rel, Math.min(full, (this.readTk.get(rel) || 0) + got));
+      const book = delegated ? this.agentTk : this.readTk;
+      book.set(rel, Math.min(full, (book.get(rel) || 0) + got));
       this.readTokens = 0;
       for (const v of this.readTk.values()) this.readTokens += v;
+      this.agentTokens = 0;
+      for (const v of this.agentTk.values()) this.agentTokens += v;
       const n = [...this.marks.values()].filter((v) => v === 'read').length;
-      this.status.setText(`radar: ${n} files · ~${this.readTokens.toLocaleString()} tk`);
+      const d = [...this.marks.values()].filter((v) => v === 'delegated').length;
+      this.status.setText(`radar: ${n} files · ~${this.readTokens.toLocaleString()} tk`
+        + (d ? ` · ${d} delegated ~${this.agentTokens.toLocaleString()} tk` : ''));
       return;
     }
     if (ev.kind === 'stop') {
@@ -567,7 +582,8 @@ module.exports = class VaultRadarPlugin extends Plugin {
         for (const id of stale) this.paintNode(lookup[id], null);
         for (const [id, state] of this.marks) {
           const hex = id === this.activePath ? COLOR.active
-            : state === 'read' ? COLOR.read : COLOR.scan;
+            : state === 'read' ? COLOR.read
+            : state === 'delegated' ? COLOR.delegated : COLOR.scan;
           if (this.paintNode(lookup[id], hex)) nowPainted.add(id);
         }
         if (typeof r.changed === 'function') r.changed();
