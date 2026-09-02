@@ -22,6 +22,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
+from urllib.parse import unquote
 
 HOME = Path(os.environ.get("VAULT_RADAR_HOME") or (Path.home() / ".vault-radar")).expanduser()
 EVENTS = HOME / "events.jsonl"
@@ -261,9 +262,6 @@ def cmd_hook(_args: argparse.Namespace) -> int:
 SKIP_DIRS = {".git", "node_modules", ".obsidian", "__pycache__", ".venv", "venv"}
 
 
-WIKILINK = re.compile(r"\[\[([^\]|#]+)")
-
-
 def scan_vault(root: Path, exts: List[str]) -> List[Dict[str, Any]]:
     """List every tracked file under root with its size and token estimate."""
     files: List[Dict[str, Any]] = []
@@ -289,15 +287,33 @@ def scan_vault(root: Path, exts: List[str]) -> List[Dict[str, Any]]:
     return files
 
 
-def scan_links(root: Path, files: List[Dict[str, Any]]) -> List[List[int]]:
-    """Resolve [[wikilinks]] between files into index pairs.
+WIKILINK = re.compile(r"\[\[([^\]|#]+)")
+# [text](target) and [text](<target with spaces>), with an optional "title"
+MDLINK = re.compile(r"\[[^\]]*\]\(<([^>]+)>\)|\[[^\]]*\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
 
-    Targets are matched on basename, which is how Obsidian resolves them too.
-    Links pointing outside the vault are dropped.
+
+def scan_links(root: Path, files: List[Dict[str, Any]]) -> List[List[int]]:
+    """Resolve [[wikilinks]] and [text](path.md) links between files into index pairs.
+
+    A target is tried as a path relative to the linking file, then to the vault
+    root, then by basename, which is how Obsidian resolves a bare wikilink. URLs,
+    anchors and mail links are dropped, as are links pointing outside the vault.
+    Without markdown links a vault written in that style is a cloud of dots.
     """
+    by_path: Dict[str, int] = {f["path"]: i for i, f in enumerate(files)}
     by_stem: Dict[str, int] = {}
     for i, f in enumerate(files):
         by_stem.setdefault(Path(f["path"]).stem, i)
+
+    def resolve(raw: str, here: Path) -> Optional[int]:
+        target = unquote(raw.strip()).split("#", 1)[0].strip()
+        if not target or "://" in target or target.startswith("mailto:"):
+            return None
+        for base in (here.parent, Path("")):
+            j = by_path.get(os.path.normpath(str(base / target)))
+            if j is not None:
+                return j
+        return by_stem.get(Path(target).stem)
 
     seen = set()
     edges: List[List[int]] = []
@@ -306,8 +322,10 @@ def scan_links(root: Path, files: List[Dict[str, Any]]) -> List[List[int]]:
             text = Path(f["abs"]).read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        for raw in WIKILINK.findall(text):
-            j = by_stem.get(Path(raw.strip()).stem)
+        here = Path(f["path"])
+        targets = WIKILINK.findall(text) + [a or b for a, b in MDLINK.findall(text)]
+        for raw in targets:
+            j = resolve(raw, here)
             if j is None or j == i:
                 continue
             key = (i, j) if i < j else (j, i)

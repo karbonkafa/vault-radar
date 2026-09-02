@@ -55,7 +55,8 @@ Three moving parts, no magic:
    reads the payload on stdin and appends one JSON line to `~/.vault-radar/events.jsonl`.
    It catches `Read`, `Grep`, `Glob` and `Bash` (agents that `cat` or `grep` from the shell are tracked too), plus `UserPromptSubmit` and `Stop`.
    A shell `cat`/`head`/`sed` counts every file it names; a shell `grep`/`rg` takes its hits from the command's own output.
-2. **A server.** `radar.py serve` indexes your vault once (path, size, token estimate)
+2. **A server.** `radar.py serve` indexes your vault once (path, size, token estimate,
+   and the `[[wikilinks]]` and `[text](path.md)` links between notes, which are the graph's edges)
    and tails the event log, pushing each new line over Server-Sent Events.
 3. **A viewer.** A single HTML file. Every file in your vault is one row; rows light
    up as the agent touches them, and a small sprite walks from the prompt down to

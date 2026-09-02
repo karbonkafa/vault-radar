@@ -60,7 +60,8 @@ Tarayıcı penceresini ekranın sağ yarısına park et ve her zamanki gibi çal
    `UserPromptSubmit` ve `Stop` olaylarını yakalıyor. Kabuktan `cat`/`head`/`sed` ile
    okunan her dosya sayılır; kabuk `grep`/`rg` eşleşmelerini komutun kendi çıktısından alır.
 2. **Bir sunucu.** `radar.py serve` vault'unu bir kez indeksliyor (yol, boyut,
-   tahmini token) ve olay log'unu takip edip her yeni satırı Server-Sent Events
+   tahmini token ve notlar arasındaki `[[wikilink]]` ile `[metin](dosya.md)` bağlantıları,
+   yani grafın kenarları) ve olay log'unu takip edip her yeni satırı Server-Sent Events
    üzerinden gönderiyor.
 3. **Bir görüntüleyici.** Tek bir HTML dosyası. Vault'undaki her dosya bir satır;
    ajan dokundukça satırlar yanıyor ve küçük bir sprite prompt'tan o an okunan
