@@ -40,6 +40,41 @@ def build_vault(root):
             fh.write(text)
 
 
+def ui_override_check(env, tv, tmp):
+    """VAULT_RADAR_UI points serve at another viewer directory: the events and the API
+    stay the radar's, only the page changes. This is how a private instrument (kai-radar)
+    rides on the public server. Returns [(name, ok, detail)]."""
+    import socket
+    import time
+    import urllib.request
+
+    ui_dir = os.path.join(tmp, "other-ui")
+    os.makedirs(ui_dir, exist_ok=True)
+    with open(os.path.join(ui_dir, "index.html"), "w", encoding="utf-8") as fh:
+        fh.write("<!doctype html><title>OTHER-UI-MARKER</title>")
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    proc = subprocess.Popen([sys.executable, RADAR, "serve", "--vault", tv, "--port", str(port), "--no-open"],
+                            env=dict(env, VAULT_RADAR_UI=ui_dir), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    page = ""
+    try:
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            try:
+                page = urllib.request.urlopen("http://127.0.0.1:%d/" % port, timeout=1.0).read().decode("utf-8", "replace")
+                break
+            except Exception:
+                time.sleep(0.1)
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    return [("serve: VAULT_RADAR_UI swaps the page, not the server", "OTHER-UI-MARKER" in page, page[:120])]
+
+
 def server_checks(env, tv, events_path):
     """RESET clears displays, never the shared log. Returns [(name, ok, detail)]."""
     import socket
@@ -195,6 +230,17 @@ def main():
     })
     kai_read = json.dumps({"content": "1|foo line1\n2|line2\n"})
 
+    # a Claude Code transcript: usage sits on assistant messages; the last one is the
+    # context as it stands now (input + cache creation + cache read) and that turn's output
+    transcript = os.path.join(tmp, "transcript.jsonl")
+    with open(transcript, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"type": "user", "message": {"role": "user", "content": "hi"}}) + "\n")
+        fh.write(json.dumps({"type": "assistant", "message": {"role": "assistant", "usage": {
+            "input_tokens": 5, "cache_creation_input_tokens": 100, "cache_read_input_tokens": 1000, "output_tokens": 9}}}) + "\n")
+        fh.write(json.dumps({"type": "assistant", "message": {"role": "assistant", "usage": {
+            "input_tokens": 112, "cache_creation_input_tokens": 686, "cache_read_input_tokens": 168218, "output_tokens": 288,
+            "output_tokens_details": {"thinking_tokens": 0}}}}) + "\n")
+
     cases = [
         # -- Claude Code: shell reads and scans -------------------------------------
         ("cat a; echo; cat b", sh("cat notes/a.md; echo ==; cat notes/b.md", A + "==\n" + B),
@@ -309,6 +355,20 @@ def main():
         ("Codex shell grep -rl", {"hook_event_name": "PostToolUse", "tool_name": "shell", "tool_input": {"command": "grep -rl foo notes"},
                                   "tool_response": {"stdout": "notes/a.md\n"}, "session_id": "01a0-codex", "cwd": tv},
          [sc("grep -rl foo notes", ["notes/a.md"], shell=True)]),
+        # -- token consumption: the transcript's last usage record rides on the event ---
+        ("Claude Read with transcript usage", claude("Read", {"file_path": p("notes/a.md")}, {"file": {"content": A}},
+                                                    transcript_path=transcript),
+         [dict(rd("notes/a.md", 44), usage={"context": 112 + 686 + 168218, "output": 288,
+                                           "total_out": 9 + 288, "turns": 1})]),
+        # the same transcript again: totals come from a cache keyed on the file, not a
+        # second full scan, and they must not double
+        ("Claude Read, transcript unchanged", claude("Read", {"file_path": p("notes/a.md")}, {"file": {"content": A}},
+                                                    transcript_path=transcript),
+         [dict(rd("notes/a.md", 44), usage={"context": 112 + 686 + 168218, "output": 288,
+                                           "total_out": 9 + 288, "turns": 1})]),
+        ("Claude Read with a missing transcript", claude("Read", {"file_path": p("notes/a.md")}, {"file": {"content": A}},
+                                                        transcript_path=os.path.join(tmp, "nope.jsonl")),
+         [rd("notes/a.md", 44)]),
         # -- never fail loudly ---------------------------------------------------------
         ("malformed payload", "not json", []),
     ]
@@ -346,7 +406,7 @@ def main():
             print("   rc=%s out=%r err=%r" % (proc.returncode, proc.stdout, proc.stderr[-200:]))
             print("   expected:", json.dumps(exp, ensure_ascii=False))
             print("   got:     ", json.dumps(got, ensure_ascii=False))
-    server = server_checks(env, tv, events_path)
+    server = server_checks(env, tv, events_path) + ui_override_check(env, tv, tmp)
     for name, ok, detail in server:
         print(("PASS " if ok else "FAIL ") + name)
         if not ok:

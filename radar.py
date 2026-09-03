@@ -31,7 +31,9 @@ from urllib.parse import unquote
 
 HOME = Path(os.environ.get("VAULT_RADAR_HOME") or (Path.home() / ".vault-radar")).expanduser()
 EVENTS = HOME / "events.jsonl"
-UI_DIR = Path(__file__).resolve().parent / "ui"
+# Another viewer can ride on this server: VAULT_RADAR_UI names a directory whose
+# index.html is served instead of ours. The events, the API and the hooks stay the same.
+UI_DIR = Path(os.environ.get("VAULT_RADAR_UI") or (Path(__file__).resolve().parent / "ui")).expanduser()
 FOLLOW = HOME / "follow"
 THEMES_DIR = HOME / "themes"
 
@@ -426,6 +428,98 @@ def _from_antigravity(payload: Dict[str, Any], event: str) -> List[Dict[str, Any
     return []
 
 
+USAGE_CACHE = HOME / "usage.json"
+
+
+def _usage_record(line: str) -> Optional[Dict[str, Any]]:
+    """The usage dict inside one transcript line, or None."""
+    if '"usage"' not in line:
+        return None
+    try:
+        rec = json.loads(line)
+    except Exception:
+        return None  # a tail read usually cuts its first line in half
+    if not isinstance(rec, dict):
+        return None
+    usage = (rec.get("message") or {}).get("usage") if isinstance(rec.get("message"), dict) else None
+    if not isinstance(usage, dict):
+        usage = rec.get("usage")
+    return usage if isinstance(usage, dict) else None
+
+
+def _is_prompt(line: str) -> bool:
+    """A user turn typed by the person: a user record whose content is text, not tool results."""
+    if '"user"' not in line:
+        return False
+    try:
+        rec = json.loads(line)
+    except Exception:
+        return False
+    if not isinstance(rec, dict) or rec.get("type") != "user":
+        return False
+    content = (rec.get("message") or {}).get("content") if isinstance(rec.get("message"), dict) else None
+    if isinstance(content, str):
+        return True
+    if isinstance(content, list):
+        return bool(content) and all(isinstance(b, dict) and b.get("type") == "text" for b in content)
+    return False
+
+
+def _transcript_usage(path: Any) -> Optional[Dict[str, int]]:
+    """Token use from an agent transcript. Two numbers from its last usage record: the
+    context as it stands now (input + cache creation + cache read) and that turn's
+    output. Two more across the whole file: output tokens in total and prompts typed.
+    The whole-file pair is kept in a small cache keyed on the transcript path and only
+    the bytes appended since the last hook are read, so a long session stays cheap.
+    A missing or odd file yields None."""
+    try:
+        if not path:
+            return None
+        fp = Path(str(path)).expanduser()
+        size = fp.stat().st_size
+        cache: Dict[str, Any] = {}
+        try:
+            cache = json.loads(USAGE_CACHE.read_text(encoding="utf-8"))
+            if not isinstance(cache, dict):
+                cache = {}
+        except Exception:
+            cache = {}
+        key = str(fp)
+        state = cache.get(key) if isinstance(cache.get(key), dict) else None
+        if not state or int(state.get("offset", 0)) > size:
+            state = {"offset": 0, "total_out": 0, "turns": 0, "partial": ""}
+        last: Optional[Dict[str, Any]] = None
+        with fp.open("rb") as fh:
+            fh.seek(int(state["offset"]))
+            chunk = fh.read()
+        text = str(state.get("partial", "")) + chunk.decode("utf-8", "replace")
+        lines = text.split("\n")
+        state["partial"] = lines.pop()  # an unfinished last line waits for the next hook
+        for line in lines:
+            usage = _usage_record(line)
+            if usage:
+                state["total_out"] += int(usage.get("output_tokens") or 0)
+                last = usage
+            elif _is_prompt(line):
+                state["turns"] += 1
+        state["offset"] = size - len(state["partial"].encode("utf-8"))
+        state["last"] = last or state.get("last")
+        cache[key] = state
+        try:
+            USAGE_CACHE.parent.mkdir(parents=True, exist_ok=True)
+            USAGE_CACHE.write_text(json.dumps(cache), encoding="utf-8")
+        except Exception:
+            pass  # the cache is a saving, not a requirement
+        usage = state.get("last")
+        if not isinstance(usage, dict):
+            return None
+        n = lambda k: int(usage.get(k) or 0)  # noqa: E731
+        return {"context": n("input_tokens") + n("cache_creation_input_tokens") + n("cache_read_input_tokens"),
+                "output": n("output_tokens"), "total_out": int(state["total_out"]), "turns": int(state["turns"])}
+    except Exception:
+        return None
+
+
 def cmd_hook(args: argparse.Namespace) -> int:
     """Read one hook payload on stdin and append a radar event. Never blocks the agent."""
     agent = getattr(args, "agent", None) or os.environ.get("VAULT_RADAR_AGENT") or None
@@ -459,6 +553,9 @@ def cmd_hook(args: argparse.Namespace) -> int:
             for key in ("agent_id", "agent_type"):
                 if payload.get(key):
                     stamp[key] = str(payload[key])
+            usage = _transcript_usage(payload.get("transcript_path"))
+            if usage:
+                stamp["usage"] = usage
             for ev in events:
                 ev.update(stamp)
             _append_events(events)
